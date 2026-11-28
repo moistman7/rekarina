@@ -15,6 +15,7 @@
 // 9365-9488, 9489-9921, 10013-10079 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the uniform-buffer spans, texture and
 // sampler descriptor lookups and the dispatch flow follow LAS Recomp runtime/nvn/vulkan/exec.c:1851-1908, 2300-2516
 // @ da35b83a (MIT, Copyright (c) 2026 Peiikai). The support buffer layout is Ryujinx's SupportBuffer.cs (MIT).
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -30,6 +31,9 @@
 #include "vk_exec.h"
 #include "platform/platform.h"
 #include "vk_dlaa.h"
+#ifdef GAME_OOT
+#include "layout.h"
+#endif
 
 #define MAX_BINDINGS 128
 #define MAX_DESC 1024
@@ -110,7 +114,7 @@ typedef struct {
     VkImage image;
     VkFormat format;
     VkImageViewType type;
-    uint32_t aspect, level0, levels, layer0, layers, swz, serial, zero;   // zero: always 0 (no padding)
+    uint32_t aspect, level0, levels, layer0, layers, swz, serial, usage;
 } ViewKey;
 _Static_assert(sizeof(ViewKey) == 48, "ViewKey is hashed as bytes: no padding");
 typedef struct { uint64_t addr, size; int owned; } Range;   // owned: a mirror wrote it and copies it back whole
@@ -712,7 +716,8 @@ static int sampled_view_setup(const VkTexImage *img, const view_t *v, int hv, ui
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
     if ((img->samples > 1) != ms || (storage && ms)) return 0;
-    if (storage && !(img->usage & VK_IMAGE_USAGE_STORAGE_BIT)) return 0;
+    VkImageUsageFlags purpose = storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (!(img->usage & purpose)) return 0;
     int cube = vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
     int ok = 0;
     switch (vt) {
@@ -771,7 +776,7 @@ static int sampled_view_setup(const VkTexImage *img, const view_t *v, int hv, ui
                                 .components = {swz_of(sw[0]), swz_of(sw[1]), swz_of(sw[2]), swz_of(sw[3])},
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     *useout = (VkImageViewUsageCreateInfo){.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-                                           .usage = VK_IMAGE_USAGE_SAMPLED_BIT};
+                                           .usage = purpose};
     if (img->block_views) ci.pNext = useout;   // the image's COLOR_ATTACHMENT usage is its block views' (vk_texture.c)
 #ifdef GAME_NS2
     ci.format = vf;
@@ -785,6 +790,7 @@ static int sampled_view_setup(const VkTexImage *img, const view_t *v, int hv, ui
         ci.pNext = useout;
     }
 #endif
+    if (ci.pNext) kout->usage = useout->usage;
     *ciout = ci;
     return 1;
 }
@@ -3896,17 +3902,12 @@ static int display_composite_format(VkFormat format) {
     return format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || format == VK_FORMAT_R16G16B16A16_SFLOAT;
 }
 
-static void scene_output_draw(VkExec *execution, const VkPipeState *state, const VkPipeInfo *information, int count) {
-    if (!execution->scene_output_role) return;
+static const VkTexImage *scene_output_draw(VkExec *execution, const VkPipeState *state,
+                                            const VkPipeInfo *information, int count) {
+    const VkTexImage *none = NULL;
+    if (!(execution->scene_output_role & DRAW_ROLE_SCENE_OUTPUT)) return none;
     const int encode = execution->scene_output_role == DRAW_ROLE_SCENE_ENCODE;
-    const int prebloom = vk_dlaa_prebloom_enabled(), coverage = vk_interface_coverage_enabled();
-#ifdef GAME_OOT
-    // ADR-0001: only record Output Proof when Guest PQ or RT_TRACE_GFX is active so SDR/Host HDR pay zero cost.
-    const int track_output = encode && vk_hdr_output_track_enabled();
-    if (!track_output && !prebloom && !coverage) return;
-#else
-    if (!prebloom && !coverage) return;
-#endif
+    if (!encode && !vk_dlaa_prebloom_enabled()) return none;
     const VkExecTarget *destination = &execution->color[0];
     if (!encode && vk_dlaa_pathlog())
         rt_log("PATHLOG direct composite draw: count %d prim %d targets %d layers %u depth %d/%d mask %#x",
@@ -3915,55 +3916,63 @@ static void scene_output_draw(VkExec *execution, const VkPipeState *state, const
     if (execution->pass_ncolor != 1 || execution->pass_layers != 1 || state->ds.dt || state->ds.dw ||
         execution->gpu_cond || state->feedback || state->raster_discard || (state->color.blend_en & 1) ||
         state->color.logic_op != NVN_LOGIC_OP_COPY || vk_pipeline_target_wmask(state, 0) != 15 ||
-        count != (encode ? 6 : 3)) return;
-    const int srgb_target = destination->format == VK_FORMAT_R8G8B8A8_SRGB || destination->format == VK_FORMAT_B8G8R8A8_SRGB;
-#ifdef GAME_OOT
-    const int pq_target = destination->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-#else
-    const int pq_target = 0;
-#endif
+        count != (encode ? 6 : 3)) return none;
     if (!destination->img || destination->samples != 1 || destination->level || destination->base_layer || destination->is3d ||
-        (encode ? execution->depth.image || (!srgb_target && !pq_target)
-                : !display_composite_format(destination->format))) return;
+        (encode ? execution->depth.image || (destination->format != VK_FORMAT_R8G8B8A8_SRGB && destination->format != VK_FORMAT_B8G8R8A8_SRGB &&
+                                              destination->format != VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+                : !display_composite_format(destination->format))) return none;
     VkViewport viewport = draw_viewport(execution);
     VkRect2D scissor = vk_exec_scissor(execution);
     if (viewport.x != 0 || viewport.y != (float)destination->height || viewport.width != (float)destination->width ||
         viewport.height != -(float)destination->height || scissor.offset.x || scissor.offset.y ||
-        scissor.extent.width != destination->width || scissor.extent.height != destination->height) return;
+        scissor.extent.width != destination->width || scissor.extent.height != destination->height) return none;
     const GfxShaderRes *sampled = NULL;
     for (uint32_t index = 0; index < information->n_bindings; ++index) {
         const VkPipeBinding *binding = &information->bindings[index];
         if (binding->kind != GFX_RES_TEX || binding->stage != GFX_STAGE_FS) continue;
-        if (sampled || !binding->res || binding->count > 1) return;
+        if (sampled || !binding->res || binding->count > 1) return none;
         sampled = binding->res;
     }
-    if (!sampled || sampled->slot < 0 || sampled->slot >= 128 || sampled->type != 3 || sampled->separate) return;
+    if (!sampled || sampled->slot < 0 || sampled->slot >= 128 || sampled->type != 3 || sampled->separate) return none;
     view_t view = {0};
     int has_view = 0;
     const VkTexImage *source = vk_texture_by_id(NVN_HANDLE_TEX(execution->tex[NVN_STAGE_FS][sampled->slot]), &view, &has_view);
     if (!source || source->samples != 1 || source->image == destination->image ||
-        source->width != destination->width || source->height != destination->height) return;
+        source->width != destination->width || source->height != destination->height) return none;
     TexVkFormat sampled_format;
     if (has_view && ((view.set_levels && view.base_level) || (view.set_layers && view.min_layer) || view.set_swizzle ||
-                     (view.set_format && (!tex_vk_format(view.format, &sampled_format) || sampled_format.vk != source->format)))) return;
+                     (view.set_format && (!tex_vk_format(view.format, &sampled_format) || sampled_format.vk != source->format)))) return none;
 #ifdef GAME_OOT
-    if (track_output && state->fs && source->image != destination->image &&
-        destination->image == destination->img->image) {
+    if (encode && vk_dlaa_pathlog())
+        rt_log("PATHLOG guest output f %llu composite s%u fmt %d -> window s%u fmt %d",
+               (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), source->serial, source->format,
+               destination->img->serial, destination->format);
+    if (encode && state->fs) {
+        const uint8_t *id = gfx_shader_input_id(state->fs);
         static const uint8_t sdr[] = {0xea, 0x16, 0x31, 0x08, 0xd2, 0xa8, 0x2e, 0x96};
-        execution->output_pq = (VkGuestPq){0};
-        if (pq_target && gfx_shader_guest_pq(state->fs)) {
-            execution->output_encoding = GFX_OUTPUT_PQ;
-            scene_output_pq(execution);
-        } else if (srgb_target && !memcmp(gfx_shader_input_id(state->fs), sdr, sizeof sdr))
-            execution->output_encoding = GFX_OUTPUT_SDR;
+        if (gfx_shader_guest_pq(state->fs)) execution->output_encoding = GFX_OUTPUT_PQ;
+        else if (id && !memcmp(id, sdr, sizeof sdr)) execution->output_encoding = GFX_OUTPUT_SDR;
+        if (execution->output_encoding && (rt_trace & RT_TRACE_GFX)) {
+            static VkFormat previous_format;
+            if (previous_format != source->format) {
+                previous_format = source->format;
+                const char *name = source->format == VK_FORMAT_R16G16B16A16_SFLOAT ? "RGBA16F" :
+                                   source->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? "R11G11B10F" : "other";
+                rt_log("hdr: checked game compositor %s (Vulkan format %d)", name, source->format);
+            }
+        }
+    }
+    if (encode && execution->output_encoding == GFX_OUTPUT_PQ &&
+        execution->hdr_aa.phase == 4 && execution->hdr_aa.composite == source->serial &&
+        execution->hdr_aa.frame == __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1) {
+        if (execution->hdr_aa.active && source->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+            (source->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) execution->hdr_aa.probe_source = source->image;
     }
 #endif
-    if (pq_target) return;  // The existing pre-bloom and interface handoffs only recognize the SDR encode.
-    if (prebloom && (source->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
-                    (encode && display_composite_format(source->format))))
+    if (vk_dlaa_prebloom_enabled() && (source->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+                                     (encode && display_composite_format(source->format))))
         execution->direct_draw_source = source->serial;
-    if (encode && !vk_hdr_active() && coverage && vk_interface_coverage_source(source->image))
-        execution->interface_copy_source = source->image;
+    return encode && execution->output_encoding ? source : none;
 }
 
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
@@ -4051,6 +4060,16 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
     if (!vs || (has_fs && !fs)) return vk_exec_oq_draw_lost(ex), 0;
+#ifdef GAME_OOT
+    if (ex->scene_output_role == DRAW_ROLE_SCENE_ENCODE && gfx_shader_guest_pq(fs)) {
+        scene_output_pq(ex);
+    } else if (fs && ex->scene_output_role == DRAW_ROLE_SCENE_TONEMAP) {
+        if (vk_hdr_renodx_scene()) fs = gfx_shader_renodx_variant(fs, GFX_RENODX_HDR);
+        else if (vk_hdr_sdr_scene()) fs = gfx_shader_renodx_variant(fs, GFX_RENODX_SDR);
+        else if (vk_hdr_scene_grade()) fs = gfx_shader_renodx_variant(fs, GFX_RENODX_GRADE);
+        else if (vk_hdr_renodx_effects()) fs = gfx_shader_renodx_variant(fs, GFX_RENODX_EFFECTS);
+    }
+#endif
     if (skip_sh(vs) || skip_sh(fs)) return 0;   // DEBUG-SKIPSH
     {   // DEBUG-VALOG: REKARINA_VALOG=<vs hash>:<frame>: that frame's draws with that vertex shader, their attribute formats
         // and the raw bytes of vertex 0 for each attribute (CPU-visible vertex buffers only), at most 8 draws
@@ -4205,6 +4224,10 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     }
     if (pending) return vk_exec_oq_draw_lost(ex), 0;   // a background worker is building it: the draw is skipped until it is ready
     if (!p || !info) return vk_exec_oq_draw_lost(ex), warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
+    const VkTexImage *output = scene_output_draw(ex, &s, info, count);
+#ifdef GAME_OOT
+    if (output) vk_present_guest_menu(ex, output, ex->color[0].image);
+#endif
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         uint64_t sec1 = sec_begin();
@@ -4249,6 +4272,8 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     vk_mvprev_draw(ex);
     record_fixed(ex);
     repeat_stats(ex, info);
+    if (output && vk_interface_coverage_source(output->image))
+        ex->interface_copy_source = output->image;
     bind_resources(ex, info);
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
     feedback_written(ex, &s);
@@ -4256,7 +4281,6 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
     gl_cur_vs = s.vs;   // DEBUG-GRASSLOG
     if (vk_hdr_track) vk_hdr_draw(ex, info);
-    scene_output_draw(ex, &s, info, count);
     vk_exec_oq_draw(ex);
     {   // DEBUG-OQLOG: a draw under a condition decided by a segment without queries (rendered with REKARINA_PRED_ZERO=0)
         int vk_oqlog_on(void);
@@ -4638,7 +4662,7 @@ static int mvobj_pick(VkExec *ex, const p_draw_idx *d, const GfxShader **vs_out,
         B.st.ds.st || ex->pass_layers != 1 || z->level || z->base_layer || z->layers != 1 ||
         v.x != 0.0f || v.y != (float)z->height || v.width != (float)z->width || v.height != -(float)z->height)
         return 0;
-    if (!skin_pick(ex, ex->work_scope && !vk_dlaa_reverse_only() ? &ex->work_scope->model : NULL, skin_out))
+    if (!skin_pick(ex, ex->work_scope && !ex->motion_reverse_only ? &ex->work_scope->model : NULL, skin_out))
         return 0;
     const GfxShaderRes *ur;
     int nu = gfx_shader_resources(B.st.vs, GFX_RES_UBO, &ur), reads = 0;
@@ -4810,9 +4834,8 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
 }
 
 static void mvobj_draw(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off) {
-    if (!vk_dlaa_model_motion() || MO.failed || !B.st_valid) return;
+    if (!ex->motion_models || MO.failed || !B.st_valid) return;
     if (gfx_shader_pool_mask(B.st.vs)) return;
-    if (!(vk_dlaa_available() || vk_dlaa_fg_only()) || !skin_enabled()) return;
     static int timed = -1;
     if (timed < 0) timed = rt_knob("MVOBJ_TIMES", "0");
     uint64_t t0 = timed ? kern_now_ns() : 0;
@@ -4833,7 +4856,7 @@ static void mvobj_draw(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSiz
 }
 
 int vk_fg_pose_prepare(VkExec *ex, uint64_t cam, VkImage depth, uint32_t w, uint32_t h, uint64_t token) {
-    if (!skin_enabled()) return 0;
+    if (!ex->motion_models) return 0;
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     skin_resolve(ex, frame, cam, depth, w, h, token);
     if (frame % 120 == 0) {
@@ -5487,8 +5510,7 @@ static void interface_replay_end(VkExec *ex) {
 
 static inline void hdr_output_draw_written(VkExec *ex) {
 #ifdef GAME_OOT
-    if (__builtin_expect(!vk_hdr_output_pending_frame || vk_par_worker, 1)) return;
-    if (!vk_hdr_output_pending()) return;
+    if (vk_par_worker || !vk_hdr_output_pending()) return;
     for (int i = 0; i < ex->pass_ncolor; i++) {
         const VkExecTarget *t = &ex->color[i];
         vk_hdr_output_overwrite(t->image, t->img ? t->img->addr : 0);
@@ -5946,20 +5968,20 @@ static int prepare_stages(VkExec *ex, int mesh, int prim, int restart) {
     if (!p || !info) return vk_exec_oq_draw_lost(ex), warn_once(W_PIPELINE, "a geometry or mesh pipeline could not be created: draws with it are skipped"), 0;
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (mesh == 2) {   // its vertex input and topology are static: the dynamic state is set without them, and forgotten after
-        VkPipeState d = s;
-        d.vs = NULL;
-        vk_pipeline_set_dynamic(ex->cb, &d);
+        vk_pipeline_set_dynamic_no_assembly(ex->cb, &s);
         ex->recorded++;
         B.st_valid = 0;
     } else if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         uint64_t sec1 = sec_begin();
-        vk_pipeline_set_dynamic(ex->cb, &s);
+        if (mesh) vk_pipeline_set_dynamic_no_assembly(ex->cb, &s);
+        else vk_pipeline_set_dynamic(ex->cb, &s);
         sec_end(SEC_SET_DYN, sec1);
         ex->recorded++;
         B.st = s, B.st_valid = 1;
     }
     record_fixed(ex);
     bind_resources(ex, info);
+    if (mesh == 1 && !info->mesh_standin) mesh_shading_rate(ex);
     if (!mesh) bind_vertex_buffers(ex);
     if (vk_dump_armed && mesh != 2) {   // listed with the task (else mesh, else geometry) shader in the vertex column, prim 100 + mesh
         VkPipeState d = s;
@@ -6441,7 +6463,6 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, const p_draw_mesh_ind
     dt_stamp(ex, 0);   // DEBUG-DRAWTIME
     int cond = !task_draw || mesh_task_cond();
     if (cond) GPU_COND_BEGIN(ex);
-    mesh_shading_rate(ex);
     if (di) vk_pipeline_draw_mesh_indirect(ex->cb, ib, io);
     else vk_pipeline_draw_mesh(ex->cb, d->count);
     if (cond) GPU_COND_END(ex);
@@ -6652,6 +6673,319 @@ static void pk_record(VkExec *ex, uint64_t ind, uint64_t caller) {
 #ifdef GAME_NS2
 // The compute program of a dispatch is the one bound with the compute bit (VkExec.cprog), else the program bound last.
 #define DISPATCH_PROGRAM(ex) const prog_t *gprog_ = (ex)->prog; if ((ex)->cprog) (ex)->prog = (ex)->cprog
+#ifdef GAME_OOT
+#define AA_PROBE_SIDE 24
+#define AA_PROBE_TEXELS (AA_PROBE_SIDE * AA_PROBE_SIDE)
+typedef struct {
+    VkBuffer buffer;
+    VmaAllocation allocation;
+    void *mapped;
+    VkGuestPq pq;
+    uint64_t frame;
+    int synthetic;
+} AaPqProbe;
+
+static const float aa_probe_rgb[4] = {-0.29382057f, 0.56644995f, -0.05028945f, 1.0f};
+static uint64_t aa_probe_injected;
+
+static int scene_aa_probe_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *setting = cfg_get("REKARINA_HDR_AA_PROBE");
+        mode = setting ? atoi(setting) : 0;
+    }
+    return mode;
+}
+
+static void scene_aa_probe_done(void *arg) {
+    AaPqProbe *probe = arg;
+    VmaAllocator vma = vk_ctx()->vma;
+    vmaInvalidateAllocation(vma, probe->allocation, 0, VK_WHOLE_SIZE);
+    const uint16_t *linear = probe->mapped;
+    const uint32_t *pq = (const uint32_t *)(linear + 4 * AA_PROBE_TEXELS);
+    unsigned signed_pixels = 0, valid = 0, mismatches = 0;
+    double worst = 0, green_leak = 0, green_min = INFINITY, green_max = 0;
+    for (unsigned i = 0; i < AA_PROBE_TEXELS; ++i) {
+        float rgb[3];
+        for (unsigned j = 0; j < 3; ++j) {
+            uint16_t bits = linear[4 * i + j];
+            _Float16 half;
+            memcpy(&half, &bits, sizeof half);
+            rgb[j] = half;
+        }
+        if (!isfinite(rgb[0]) || !isfinite(rgb[1]) || !isfinite(rgb[2])) continue;
+        int is_signed = rgb[0] < 0 || rgb[1] < 0 || rgb[2] < 0;
+        signed_pixels += is_signed;
+        valid++;
+        if (probe->synthetic) {
+            double r = 0.627403896 * rgb[0] + 0.329283038 * rgb[1] + 0.043313066 * rgb[2];
+            double g = 0.069097289 * rgb[0] + 0.919540396 * rgb[1] + 0.011362315 * rgb[2];
+            double b = 0.016391439 * rgb[0] + 0.088013308 * rgb[1] + 0.895595253 * rgb[2];
+            green_leak = fmax(green_leak, fmax(fabs(r), fabs(b)) / fmax(g, 1e-8));
+            green_min = fmin(green_min, g);
+            green_max = fmax(green_max, g);
+        }
+        double error = 0;
+        for (unsigned j = 0; j < 3; ++j) {
+            const float *r = probe->pq.row[j];
+            double y = pow(fabs((double)r[0] * rgb[0] + (double)r[1] * rgb[1] + (double)r[2] * rgb[2]) * 0.0001,
+                           2610.0 / 16384.0);
+            double expected = pow((3424.0 / 4096.0 + 2413.0 / 128.0 * y) / (1.0 + 2392.0 / 128.0 * y), 2523.0 / 32.0);
+            double actual = (pq[i] >> (10 * j) & 1023) / 1023.0;
+            error = fmax(error, fabs(expected - actual));
+        }
+        if (error > 2.0 / 1023.0) mismatches++;
+        worst = fmax(worst, error);
+    }
+    rt_log("hdr: AA PQ probe frame %llu: %u finite texels, %u signed, %u mismatches, max PQ error %.6f",
+           (unsigned long long)probe->frame, valid, signed_pixels, mismatches, worst);
+    if (probe->synthetic) {
+        const int ok = valid == AA_PROBE_TEXELS && signed_pixels == valid &&
+                       green_min >= 0.49 && green_max <= 0.51 && green_leak <= 0.01 && !mismatches;
+        rt_log("hdr: AA synthetic BT.2020 green %s: %.6f..%.6f, max relative red/blue leakage %.6f",
+               ok ? "PASS" : "FAIL", green_min, green_max, green_leak);
+    }
+    vmaDestroyBuffer(vma, probe->buffer, probe->allocation);
+    free(probe);
+}
+
+static void scene_aa_probe(VkExec *ex) {
+    VkImage source = ex->hdr_aa.probe_source;
+    ex->hdr_aa.probe_source = VK_NULL_HANDLE;
+    const VkExecTarget *dst = &ex->color[0];
+    if (!source || !ex->output_pq.valid || !dst->img || dst->format != VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+        !(dst->img->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || dst->width < AA_PROBE_SIDE || dst->height < AA_PROBE_SIDE) return;
+    static unsigned samples;
+    int mode = scene_aa_probe_mode();
+    if (!mode || !ex->hdr_aa.active || samples >= 4 ||
+        (mode == 2 ? aa_probe_injected != ex->hdr_aa.frame : ex->hdr_aa.frame % 16)) return;
+    AaPqProbe *probe = calloc(1, sizeof *probe);
+    if (!probe) return;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = AA_PROBE_TEXELS * 12,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &probe->buffer, &probe->allocation, &info) != VK_SUCCESS) {
+        free(probe);
+        return;
+    }
+    samples++;
+    probe->mapped = info.pMappedData;
+    probe->pq = ex->output_pq;
+    probe->frame = ex->hdr_aa.frame;
+    probe->synthetic = mode == 2;
+    vk_exec_barrier(ex);
+    VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .imageOffset = {(int32_t)(dst->width - AA_PROBE_SIDE) / 2, (int32_t)(dst->height - AA_PROBE_SIDE) / 2, 0},
+        .imageExtent = {AA_PROBE_SIDE, AA_PROBE_SIDE, 1}};
+    vkCmdCopyImageToBuffer(ex->cb, source, VK_IMAGE_LAYOUT_GENERAL, probe->buffer, 1, &copy);
+    copy.bufferOffset = AA_PROBE_TEXELS * 8;
+    vkCmdCopyImageToBuffer(ex->cb, dst->image, VK_IMAGE_LAYOUT_GENERAL, probe->buffer, 1, &copy);
+    VkMemoryBarrier2 host = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo dependency = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &host};
+    vkCmdPipelineBarrier2(ex->cb, &dependency);
+    ex->recorded += 3;
+    vk_defer_call(scene_aa_probe_done, probe);
+}
+
+static void scene_aa_probe_inject(VkExec *ex, VkImage image) {
+    if (!image || aa_probe_injected || scene_aa_probe_mode() != 2) return;
+    static int first_frame;
+    if (!first_frame) {
+        const char *setting = cfg_get("REKARINA_HDR_AA_PROBE_AT");
+        char *end;
+        const long frame = setting ? strtol(setting, &end, 10) : 0;
+        first_frame = 1100;
+        if (setting) {
+            if (end != setting && !*end && frame > 0 && frame <= INT32_MAX) first_frame = (int)frame;
+            else rt_log("hdr: invalid REKARINA_HDR_AA_PROBE_AT; using frame %d", first_frame);
+        }
+    }
+    if (ex->hdr_aa.frame < (uint64_t)first_frame) return;
+    // Probe only: a one-frame flat BT.2020 green expressed as signed linear BT.709.
+    VkClearColorValue color = {.float32 = {aa_probe_rgb[0], aa_probe_rgb[1], aa_probe_rgb[2], aa_probe_rgb[3]}};
+    VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vk_exec_barrier(ex);
+    vkCmdClearColorImage(ex->cb, image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+    ex->recorded++;
+    vk_exec_barrier(ex);
+    aa_probe_injected = ex->hdr_aa.frame;
+}
+
+static unsigned scene_aa_stage(uint64_t caller) {
+    switch (caller - MOD_MAIN_BASE) {
+    case 0x14e3a4c: return 1;
+    case 0x14e3a94: return 2;
+    case 0x14e3b24: return 3;
+    case 0x251bc0: return 4;
+    default: return 0;
+    }
+}
+
+static VkImage scene_aa_bindings(const VkExec *ex, unsigned stage, uint32_t serial[3], VkFormat format[3]) {
+    static const int src[] = {3, 4, 3, 0}, dst[] = {0, 1, 2, 1};
+    const uint64_t handles[] = {ex->tex[NVN_STAGE_CS][src[stage - 1]], stage == 3 ? ex->tex[NVN_STAGE_CS][5] : 0,
+                                ex->img[NVN_STAGE_CS][dst[stage - 1]]};
+    VkImage probe_image = VK_NULL_HANDLE;
+    vk_texture_lock();
+    for (unsigned i = 0; i < 3; ++i) {
+        if (!handles[i]) continue;
+        view_t view = {0};
+        int has_view = 0;
+        const VkTexImage *image = vk_texture_by_id_locked(NVN_HANDLE_TEX(handles[i]), &view, &has_view);
+        if (!image || image->gone || image->type != VK_IMAGE_TYPE_2D || image->samples != 1 || image->layers != 1 ||
+            (has_view && ((view.set_levels && view.base_level) || (view.set_layers && view.min_layer) || view.set_swizzle))) continue;
+        TexVkFormat mapped;
+        serial[i] = image->serial;
+        format[i] = has_view && view.set_format && tex_vk_format(view.format, &mapped) ? mapped.vk : image->format;
+        if (stage == 1 && i == 0 && image->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+            (image->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) probe_image = image->image;
+    }
+    vk_texture_unlock();
+    return probe_image;
+}
+
+static void bind_handles(uint64_t *dst, int cap, const p_bind_handles *b);
+static void pool_rebase(VkExec *ex, const p_bind_handles *b, uint64_t *row, int cap, int tex, int samp);
+
+static int scene_aa_prepare_stage(VkExec *ex, VkExec *next, unsigned stage, const GfxShader *cs) {
+    static const unsigned roles[] = {GFX_HDR_AA_PREP, GFX_HDR_AA_ROLES, GFX_HDR_AA_BLEND, GFX_HDR_AA_STORE};
+    if (!cs) {
+        int present, pending;
+        cs = shader_for(next, NVN_STAGE_CS, &present, &pending, 0);
+    }
+    if (!cs) return 0;
+    const unsigned i = stage - 1;
+    const GfxShader *variant = stage == 2 ? gfx_shader_aa_mask(cs) : gfx_shader_renodx_aa(cs, roles[i]);
+    if (!variant) return 0;
+    ex->hdr_aa.shader[i] = variant;
+    ex->hdr_aa.pipeline[i] = vk_pipeline_compute(variant, &ex->hdr_aa.info[i]);
+    return ex->hdr_aa.pipeline[i] && ex->hdr_aa.info[i];
+}
+
+// Resolve this recording's bindings and pipelines before changing the color basis of any dispatch.
+static int scene_aa_preflight(VkExec *ex, const GfxShader *prep, const uint32_t first[3], const VkFormat format[3]) {
+    const VkFormat fp = VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!ex->cprog || !vk_exec_cur_op || !first[0] || !first[2] || first[0] == first[2] || format[0] != fp ||
+        format[2] != VK_FORMAT_R16G16_UINT || !scene_aa_prepare_stage(ex, ex, 1, prep)) return 0;
+
+    VkExec next = {.prog = ex->prog, .tex_pool = ex->tex_pool, .samp_pool = ex->samp_pool};
+    const unsigned cs = NVN_STAGE_CS;
+    memcpy(next.tex[cs], ex->tex[cs], sizeof next.tex[cs]);
+    memcpy(next.img[cs], ex->img[cs], sizeof next.img[cs]);
+    ex->hdr_aa.ops[0] = vk_exec_cur_op;
+    const op_hdr *op = nvn_op_next(vk_exec_cur_op);
+    unsigned stage = 2;
+    uint32_t weights = 0, blend = 0;
+    for (unsigned step = 0; op && step < 192; ++step) {
+        const void *p = nvn_op_payload(op);
+        switch (op->op) {
+        case OP_JUMP: op = (const op_hdr *)(uintptr_t)((const p_jump *)p)->target; continue;
+        case OP_SET_TEX_POOL: next.tex_pool = ((const p_set_pool *)p)->pool; break;
+        case OP_SET_SAMP_POOL: next.samp_pool = ((const p_set_pool *)p)->pool; break;
+        case OP_BIND_PROGRAM: {
+            const p_bind_program *b = p;
+            if (b->stages & NVN_SHADER_STAGE_COMPUTE_BIT) {
+                if (!b->prog) return 0;
+                next.prog = b->prog;
+            }
+            break;
+        }
+        case OP_BIND_TEX: case OP_BIND_IMG: {
+            const p_bind_handles *b = p;
+            if (b->stage != cs) break;
+            const int sampled = op->op == OP_BIND_TEX;
+            uint64_t *row = sampled ? next.tex[cs] : next.img[cs];
+            const int cap = sampled ? 128 : 32;
+            if (b->first < 0 || b->n < 0 || b->n > 32 || b->first > cap - b->n) return 0;
+            bind_handles(row, cap, b);
+            pool_rebase(&next, b, row, cap, 1, sampled);
+            break;
+        }
+        case OP_BARRIER: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_SAMP:
+        case OP_UPDATE_UB: case OP_CLEAR_BUF: case OP_PUSH_CONST: break;
+        case OP_DISPATCH: case OP_DISPATCH_IND: {
+            uint64_t caller;
+            if (op->op == OP_DISPATCH) {
+                const p_dispatch *d = p;
+                if (d->x <= 0 || d->y <= 0 || d->z <= 0) return 0;
+                caller = d->caller;
+            } else {
+                const p_dispatch_ind *d = p;
+                VkMemSpan args;
+                if (stage != 2 || !vk_mem_resolve(d->ind, sizeof(VkDispatchIndirectCommand), &args) || args.offset % 4)
+                    return 0;
+                caller = d->caller;
+            }
+            if (scene_aa_stage(caller) != stage) return 0;
+            uint32_t serial[3] = {0};
+            VkFormat fmt[3] = {0};
+            scene_aa_bindings(&next, stage, serial, fmt);
+            if (!serial[0] || !serial[2] || serial[0] == serial[2]) return 0;
+            if (stage == 2) {
+                if (serial[0] != first[2]) return 0;
+                weights = serial[2];
+            } else if (stage == 3) {
+                if (fmt[0] != fp || fmt[2] != fp || serial[0] != first[0] || serial[1] != weights) return 0;
+                blend = serial[2];
+            } else if (fmt[0] != fp || fmt[2] != fp || serial[0] != blend) return 0;
+            if (!scene_aa_prepare_stage(ex, &next, stage, NULL)) return 0;
+            ex->hdr_aa.ops[stage - 1] = op;
+            if (stage++ == 4) {
+                ex->hdr_aa.composite = serial[2];
+                return 1;
+            }
+            break;
+        }
+        default: return 0;
+        }
+        op = nvn_op_next(op);
+    }
+    return 0;
+}
+
+static VkPipeline scene_aa_dispatch(VkExec *ex, uint64_t caller, const GfxShader **cs, const VkPipeInfo **info) {
+    const unsigned stage = scene_aa_stage(caller);
+    if (!stage) return VK_NULL_HANDLE;
+    const int tracing = vk_dlaa_pathlog();
+    static const char *const role[] = {"prep", "weights", "blend", "reconstruct"};
+    const uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    typeof(ex->hdr_aa) *a = &ex->hdr_aa;
+    uint32_t serial[3] = {0};
+    VkFormat format[3] = {0};
+    VkImage probe_image = VK_NULL_HANDLE;
+    const int eligible = stage == 1 && vk_hdr_renodx_scene() && (!vk_dlaa_active() || vk_dlaa_fsr1()) && !ex->gpu_cond;
+    if (eligible || tracing || stage == 2) probe_image = scene_aa_bindings(ex, stage, serial, format);
+    if (tracing)
+        rt_log("PATHLOG guest AA f %llu %s main+%llx src s%u fmt %d aux s%u fmt %d dst s%u fmt %d",
+               (unsigned long long)(frame - 1), role[stage - 1], (unsigned long long)(caller - MOD_MAIN_BASE),
+               serial[0], format[0], serial[1], format[1], serial[2], format[2]);
+    if (stage == 1) {
+        a->frame = frame;
+        a->phase = 0;
+        a->active = eligible && !cfg_env("REKARINA_SKIP_CS") &&
+                    scene_aa_preflight(ex, *cs, serial, format);
+        if (a->active) scene_aa_probe_inject(ex, probe_image);
+    }
+    if (!a->active || a->frame != frame || a->phase != stage - 1 || a->ops[stage - 1] != vk_exec_cur_op) {
+        if (stage == 2 && format[0] == VK_FORMAT_R16G16_UINT) {
+            const GfxShader *mask = gfx_shader_aa_mask(*cs);
+            if (!mask) rt_fatal("vk: the SMAA weights shader has no valid sampler for its R16G16_UINT edge mask");
+            *cs = mask;
+        }
+        return VK_NULL_HANDLE;
+    }
+    a->phase = stage;
+    *cs = a->shader[stage - 1];
+    *info = a->info[stage - 1];
+    if (tracing && stage != 2) rt_log("PATHLOG guest AA f %llu %s signed variant", (unsigned long long)(frame - 1), role[stage - 1]);
+    return a->pipeline[stage - 1];
+}
+#endif
+
 #define DISPATCH_PROGRAM_END(ex) ((ex)->prog = gprog_)
 static void op_dispatch_(VkExec *ex, const p_dispatch *d);
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
@@ -6667,6 +7001,9 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     vk_contact_flush(ex);
     cb_res(ex);
+#ifdef GAME_OOT
+    if (vk_dlaa_skip_smaa(ex, d->caller)) return;
+#endif
     dummies_init();
     int present;
     // A compute shader this machine has not translated yet is translated beside the replay, and one whose pipeline is
@@ -6678,10 +7015,23 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         if (cs_wait) left_out(LO_CS_SHADER, ex->prog->serial, NULL);
         return;
     }
-    if (vk_dlaa_dispatch(ex, cs, d->caller)) return;   // the game's scaling dispatch: DLSS wrote its picture instead
+    if (vk_dlaa_dispatch(ex, cs, d->caller)) {
+#ifdef GAME_OOT
+        // FSR 1 writes the verified reconstruction target without running the guest's last dispatch.
+        if (ex->hdr_aa.active && ex->hdr_aa.phase == 3 && ex->hdr_aa.ops[3] == vk_exec_cur_op)
+            ex->hdr_aa.phase = 4;
+#endif
+        return;
+    }
     const VkPipeInfo *info = NULL;
-    VkPipeline p = vk_pipeline_compute(cs, &info);
-    if (vk_pipeline_compute_pending()) return left_out(LO_CS_PIPE, ex->prog->serial, cs);   // being compiled beside (vk_pipeline.c)
+    VkPipeline p = VK_NULL_HANDLE;
+#ifdef GAME_OOT
+    p = scene_aa_dispatch(ex, d->caller, &cs, &info);
+#endif
+    if (!p) {
+        p = vk_pipeline_compute(cs, &info);
+        if (vk_pipeline_compute_pending()) return left_out(LO_CS_PIPE, ex->prog->serial, cs);
+    }
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
     if (vk_movienet_skip(cs)) return;   // the movies' U-Net where a movie frame does not fit its time (vk_movienet.c)
     if (vk_movienet_on() && vk_movienet_is_pass12(cs)) {   // and pass 12 then adds nothing of it
@@ -6749,10 +7099,10 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     VkPassMark *m = dispatch_mark(ex, cs, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     GPU_COND_BEGIN(ex);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
-    vk_dlaa_dispatch_recorded();
     GPU_COND_END(ex);
     vk_pass_mark_end(ex->cb, m);
     ex->dispatch_end_at = ++ex->recorded;
+    vk_dlaa_dispatch_recorded(ex);
     pk_record(ex, 0, d->caller);   // DEBUG-PEEK
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
     vk_probe_dispatch(ex, cs, info);   // DEBUG-PROBE
@@ -6772,6 +7122,9 @@ static void op_dispatch_ind_(VkExec *ex, const p_dispatch_ind *d) {
 static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
 #endif
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
+#ifdef GAME_OOT
+    if (vk_dlaa_skip_smaa(ex, d->caller)) return;
+#endif
     VkMemSpan ip;
     if (!vk_mem_resolve(d->ind, sizeof(VkDispatchIndirectCommand), &ip) || ip.offset % 4)
         return warn_once(W_INDIRECT, "indirect dispatch arguments at %#llx are not backed or not aligned: skipped", (unsigned long long)d->ind);
@@ -6785,8 +7138,14 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         return;
     }
     const VkPipeInfo *info = NULL;
-    VkPipeline p = vk_pipeline_compute(cs, &info);
-    if (vk_pipeline_compute_pending()) return left_out(LO_CS_PIPE, ex->prog->serial, cs);   // being compiled beside (vk_pipeline.c)
+    VkPipeline p = VK_NULL_HANDLE;
+#ifdef GAME_OOT
+    if (scene_aa_stage(d->caller) == 2) p = scene_aa_dispatch(ex, d->caller, &cs, &info);
+#endif
+    if (!p) {
+        p = vk_pipeline_compute(cs, &info);
+        if (vk_pipeline_compute_pending()) return left_out(LO_CS_PIPE, ex->prog->serial, cs);
+    }
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
     vk_exec_barrier(ex);
     VK_MEM_USE(ip);
@@ -7051,6 +7410,8 @@ static void bloom_draw(VkExec *execution, uint32_t operation, const void *payloa
     execution->draw_role = 0;
     if (role == VK_BLOOM_EXTRACT)
         vk_dlaa_scene_bloom(execution, private_route && drew);
+    if (!private_route && drew && rendering_enabled && role == VK_BLOOM_TONEMAP)
+        vk_dlaa_stock_tonemap(&execution->color[0]);
     if (private_route) {
         vk_exec_pass_end(execution);
         if (role != VK_BLOOM_TONEMAP) vk_dlaa_bloom_finish(execution, guest_targets, drew);
@@ -7074,13 +7435,15 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
                                  op == OP_DRAW_IDX ? ((const p_draw_idx *)payload)->draw_role :
                                  op == OP_DRAW_IDX_IND ? ((const p_draw_idx_ind *)payload)->draw_role : 0;
         ex->interface_draw = (recorded_role & DRAW_ROLE_INTERFACE) != 0;
-        ex->scene_output_role = recorded_role & DRAW_ROLE_SCENE_OUTPUT;
+        ex->scene_output_role = recorded_role & (DRAW_ROLE_SCENE_OUTPUT | DRAW_ROLE_SCENE_TONEMAP);
         ex->direct_draw_source = 0;
-#ifdef GAME_OOT
         ex->output_encoding = GFX_OUTPUT_UNSPECIFIED;
+#ifdef GAME_OOT
+        ex->output_pq = (VkGuestPq){0};
+        ex->hdr_aa.probe_source = VK_NULL_HANDLE;
 #endif
         ex->interface_copy_source = VK_NULL_HANDLE;
-        if (vk_interface_coverage_enabled()) vk_interface_coverage_check_draw(ex);
+        vk_interface_coverage_check_draw(ex);
     }
     if (dc_on < 0) {
         dc_on = cfg_env("REKARINA_DRAW_CRUMBS") != NULL;
@@ -7204,10 +7567,19 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
     case OP_DRAW: case OP_DRAW_IDX: {
         unsigned recorded_role = op == OP_DRAW ? ((const p_draw *)payload)->draw_role : ((const p_draw_idx *)payload)->draw_role;
-        unsigned bloom_role = recorded_role & ~(DRAW_ROLE_INTERFACE | DRAW_ROLE_SCENE_OUTPUT);
+        unsigned bloom_role = recorded_role & ~(DRAW_ROLE_INTERFACE | DRAW_ROLE_SCENE_OUTPUT | DRAW_ROLE_SCENE_TONEMAP);
+#ifdef GAME_OOT
+        if (!bloom_role && ex->scene_output_role == DRAW_ROLE_SCENE_TONEMAP && ex->prebloom_tonemap)
+            bloom_role = VK_BLOOM_TONEMAP;
+#endif
         if (bloom_role) bloom_draw(ex, op, payload, bloom_role);
         else {
             int drew = op == OP_DRAW ? op_draw(ex, payload) : op_draw_idx(ex, payload);
+#ifdef GAME_OOT
+            if (drew && !ex->gpu_cond && ex->scene_output_role == DRAW_ROLE_SCENE_TONEMAP)
+                vk_dlaa_stock_tonemap(&ex->color[0]);
+            if (drew && ex->scene_output_role == DRAW_ROLE_SCENE_ENCODE) scene_aa_probe(ex);
+#endif
             if (drew && ex->direct_draw_source)
                 vk_dlaa_direct_draw(&ex->color[0], ex->direct_draw_source, ex->scene_output_role == DRAW_ROLE_SCENE_ENCODE);
             if (drew && ex->interface_copy_source && ex->color[0].img)

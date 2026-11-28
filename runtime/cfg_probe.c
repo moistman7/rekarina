@@ -14,6 +14,7 @@
 
 static int fails;
 #define CHECK(c, what) do { if (!(c)) { fails++; fprintf(stderr, "FAIL cfg: %s\n", what); } } while (0)
+
 static unsigned probe_motion_consumers(CfgTaa taa, int wanted) {
     (void)taa;
     return wanted ? CFG_RENDER_UPSCALER : 0;
@@ -251,6 +252,25 @@ int probe_cfg(void) {
     CHECK(cfg_restart_pending(), "restart pending: restart-only setting triggers it");
     cfg_set("REKARINA_GAME_RES", "1440");
     CHECK(!cfg_restart_pending(), "restart pending: reverting to boot value clears it");
+#ifdef GAME_OOT
+    cfg_set("REKARINA_FRAMEGEN", "fsr3");
+    CHECK(!cfg_restart_pending(), "frame generation restart is decided by the running renderer");
+    cfg_set("REKARINA_FRAMEGEN", "off");
+    if (!cfg_from_env("REKARINA_DLAA")) {
+        const char *initial_aa = cfg_bool("REKARINA_DLAA") ? "1" : "0";
+        cfg_set("REKARINA_DLAA", initial_aa[0] == '1' ? "0" : "1");
+        CHECK(!cfg_restart_pending(), "changing DLSS / DLAA does not request a restart");
+        cfg_set("REKARINA_DLAA", initial_aa);
+    }
+    if (!cfg_from_env("REKARINA_TAA")) {
+        CfgTaa initial_taa = cfg_taa();
+        cfg_set("REKARINA_TAA", initial_taa == CFG_TAA_DLSS ? "fsr1" : "dlss");
+        CHECK(!cfg_restart_pending() && cfg_taa() != initial_taa, "changing the AA backend applies without a restart");
+        cfg_set("REKARINA_TAA", "bilinear");
+        CHECK(cfg_taa() == CFG_TAA_BILINEAR && !cfg_restart_pending(), "bilinear scene scaling is a distinct live choice");
+        cfg_set("REKARINA_TAA", initial_taa == CFG_TAA_DLSS ? "dlss" : initial_taa == CFG_TAA_FSR1 ? "fsr1" : "fsr3");
+    }
+#endif
     CHECK(rumble_motor(0, 0.6f, 1.3f) == 0 && rumble_motor(0.5f, 0.6f, 0) == 0, "rumble: zero amplitude or strength is silent");
     CHECK(rumble_motor(1, 0.6f, 3) == 65535 && rumble_motor(5, 1, 1) == 65535, "rumble: saturates at 65535");
     CHECK(rumble_motor(0.25f, 1, 1) > 16000 && rumble_motor(0.25f, 1, 1) < 16800, "rumble: curve 1, strength 100% is linear");
@@ -559,7 +579,33 @@ int probe_cfg(void) {
     cfg_render_release(latest);
     plat_setenv("REKARINA_SHARPNESS", NULL);
     plat_setenv("TOTK_SHARPNESS", NULL);
+#ifdef GAME_OOT
+    const char *reset_sharpness[] = {"SHARPNESS"};
+    cfg_reset(reset_sharpness, 1);
+    cfg_render_publish();
+    const CfgRenderState *default_sharpness = cfg_render_acquire();
+    cfg_set("REKARINA_SHARPNESS", "65");
+    cfg_render_publish();
+    const CfgRenderState *manual_sharpness = cfg_render_acquire();
+    cfg_render_use(default_sharpness);
+    CHECK(cfg_scene_sharpness(1) == 0 && cfg_scene_sharpness(0) == 80,
+          "a pinned default frame skips RCAS on NDSR and uses 80% on replacement scaling");
+    cfg_render_use(manual_sharpness);
+    CHECK(cfg_scene_sharpness(1) == 0 && cfg_scene_sharpness(0) == 65,
+          "NDSR skips RCAS even when a non-default strength is stored");
+    cfg_render_use(NULL);
+    cfg_render_release(default_sharpness);
+    cfg_render_release(manual_sharpness);
+    cfg_set("REKARINA_SHARPNESS", "0");
+    CHECK(cfg_scene_sharpness(1) == 0 && cfg_scene_sharpness(0) == 0,
+          "zero strength disables sharpening on replacement scaling too");
+#endif
     cfg_set("REKARINA_SHARPNESS", "80");
+#ifdef GAME_OOT
+    plat_setenv("REKARINA_TEXTURE_LOD_STRENGTH", NULL);
+    plat_setenv("TOTK_TEXTURE_LOD_STRENGTH", NULL);
+    cfg_set("REKARINA_TEXTURE_LOD_STRENGTH", "65");
+#endif
     cfg_render_publish();
     cfg_render_frame_begin();
     const CfgRenderState *frame = cfg_render_frame_acquire();
@@ -582,6 +628,9 @@ int probe_cfg(void) {
     CHECK(cfg_render_values()->sharpness == (sharpness == 33 ? 34 : 33) &&
           cfg_render_values()->projection_revision == projection_revision,
           "a non-projection setting applies next frame without invalidating projection");
+#ifdef GAME_OOT
+    CHECK(cfg_int("REKARINA_TEXTURE_LOD_STRENGTH") == 65, "changing RCAS leaves the texture LOD setting alone");
+#endif
     cfg_render_use(NULL);
     cfg_render_release(next_frame);
     if (!cfg_from_env("REKARINA_DLAA")) {
@@ -592,6 +641,50 @@ int probe_cfg(void) {
         cfg_render_use(next_frame);
         CHECK(cfg_render_values()->dlaa != old_dlaa && cfg_render_values()->projection_revision != projection_revision,
               "a changed AA mode invalidates projection at the next frame");
+        cfg_render_use(NULL);
+        cfg_render_release(next_frame);
+    }
+    if (!cfg_from_env("REKARINA_TAA")) {
+        const CfgRenderState *before = cfg_render_frame_acquire();
+        cfg_render_use(before);
+        CfgTaa backend = cfg_taa();
+        unsigned rev = cfg_render_values()->projection_revision;
+        cfg_render_use(NULL);
+        cfg_set("REKARINA_TAA", backend == CFG_TAA_FSR1 ? "dlss" : "fsr1");
+        cfg_render_publish();
+        cfg_render_use(before);
+        CHECK(cfg_taa() == backend && cfg_render_values()->projection_revision == rev, "active frame retains its AA backend");
+        cfg_render_use(NULL);
+        cfg_render_release(before);
+        cfg_render_frame_begin();
+        next_frame = cfg_render_frame_acquire();
+        cfg_render_use(next_frame);
+        CHECK(cfg_taa() != backend && cfg_render_values()->projection_revision != rev, "next frame applies the AA backend and invalidates projection");
+        cfg_render_use(NULL);
+        cfg_render_release(next_frame);
+    }
+    if (!cfg_from_env("REKARINA_TAA") && !cfg_from_env("REKARINA_FSR_VERSION")) {
+        cfg_set("REKARINA_TAA", "fsr3");
+        cfg_set("REKARINA_FSR_VERSION", "3");
+        cfg_render_publish();
+        cfg_render_frame_begin();
+        const CfgRenderState *before = cfg_render_frame_acquire();
+        cfg_render_use(before);
+        unsigned rev = cfg_render_values()->projection_revision;
+        cfg_render_use(NULL);
+        cfg_set("REKARINA_FSR_VERSION", "4");
+        cfg_render_publish();
+        cfg_render_use(before);
+        CHECK(EQ(cfg_value("REKARINA_FSR_VERSION"), "3") && cfg_render_values()->projection_revision == rev,
+              "active frame retains its FSR generation");
+        cfg_render_use(NULL);
+        cfg_render_release(before);
+        cfg_render_frame_begin();
+        next_frame = cfg_render_frame_acquire();
+        cfg_render_use(next_frame);
+        CHECK(cfg_taa() == CFG_TAA_FSR3 && EQ(cfg_value("REKARINA_FSR_VERSION"), "4") &&
+              cfg_render_values()->projection_revision != rev && !cfg_restart_pending(),
+              "a live change of FSR generation invalidates projection without switching backend");
         cfg_render_use(NULL);
         cfg_render_release(next_frame);
     }
@@ -674,6 +767,29 @@ int probe_cfg(void) {
     CHECK(plat_file_write(path, old_layout_own, sizeof old_layout_own - 1) && cfg_load(path) == 1 &&
               EQ(cfg_get("REKARINA_PAD_LAYOUT"), "nintendo") && EQ(cfg_get("REKARINA_PROMPTS"), "nintendo"),
           "a prompts line of the file's own wins over 0.1.9's pad_layout = xbox_prompts");
+#ifdef GAME_OOT
+    plat_setenv("REKARINA_HDR_TONEMAP", NULL);
+    plat_setenv("TOTK_HDR_TONEMAP", NULL);
+    static const char old_mapper[] = "[display]\r\nhdr_tonemap = renodrt\r\n";
+    CHECK(plat_file_write(path, old_mapper, sizeof old_mapper - 1) && cfg_load(path) == 1 &&
+              EQ(cfg_value("REKARINA_HDR_TONEMAP"), "psychov35"),
+          "retired HDR mapper in an old config resolves to PsychoV35");
+    cfg_set("REKARINA_HDR_TONEMAP", "vanilla");
+    plat_setenv("REKARINA_HDR_TONEMAP", "renodrt");
+    CHECK(EQ(cfg_value("REKARINA_HDR_TONEMAP"), "psychov35"), "retired HDR environment override resolves to PsychoV35");
+    plat_setenv("REKARINA_HDR_TONEMAP", NULL);
+    CHECK(EQ(cfg_value("REKARINA_HDR_TONEMAP"), "vanilla"), "Vanilla HDR mapper remains selectable");
+    static const char native_hdr[] = "[display]\r\nhdr = native\r\nhdr_tonemap = psychov35\r\n";
+    CHECK(plat_file_write(path, native_hdr, sizeof native_hdr - 1) && cfg_load(path) == 1 &&
+          EQ(cfg_get("REKARINA_HDR"), "1") && EQ(cfg_get("REKARINA_HDR_TONEMAP"), "vanilla"),
+          "old Native HDR selects HDR and Vanilla even if a PsychoV35 preference was saved");
+    cfg_set("REKARINA_HDR_TONEMAP", "psychov35");
+    CHECK(EQ(cfg_value("REKARINA_HDR_TONEMAP"), "psychov35"), "migrated HDR can select PsychoV35 live");
+    plat_setenv("REKARINA_HDR", "native");
+    CHECK(EQ(cfg_value("REKARINA_HDR"), "1") && EQ(cfg_value("REKARINA_HDR_TONEMAP"), "vanilla"),
+          "old HDR environment override still forces Vanilla HDR");
+    plat_setenv("REKARINA_HDR", NULL);
+#endif
     plat_file_delete(path);
     cfg_load("cfg-probe-missing.ini");
     int listed = 0;

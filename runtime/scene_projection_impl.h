@@ -155,6 +155,7 @@ static void scene_projection_build_(Cpu *c) {
         *c = result;
         s.token |= SCENE_PROJECTION_SHIFTED;
     }
+
     memcpy(s.projection, (const void *)(uintptr_t)(record + 0x1a8), sizeof s.projection);
     plat_mutex_lock(&projection_lock);
     if (s.generation == generation && projection_sequence(s.token) == serial) pending = s;
@@ -295,15 +296,14 @@ static unsigned bloom_draw_stage(unsigned role, unsigned level) {
 unsigned scene_bloom_draw_role(uint64_t return_address) {
     if (bloom_scope && return_address == MOD_MAIN_BASE + 0x24c254) return bloom_draw_stage(VK_BLOOM_EXTRACT, 2);
     if (bloom_stage) return bloom_stage;
-    if (return_address == MOD_MAIN_BASE + 0x28cac4 && vk_dlaa_prebloom_enabled() &&
-        !vk_dlaa_fsr1() && !vk_dlaa_fsr3()) return VK_BLOOM_TONEMAP;
     return 0;
 }
 
 unsigned scene_output_draw_role(uint64_t return_address) {
-    if (prebloom_set < 0) return 0;  // These call sites belong to the checked 1.1.1 scene hooks.
-    if (return_address == MOD_MAIN_BASE + 0xa06164) return DRAW_ROLE_SCENE_COMPOSITE;
     if (return_address == MOD_MAIN_BASE + 0x270680) return DRAW_ROLE_SCENE_ENCODE;
+    // Both gameplay and pause call the scene mapper here, even without pre-bloom reconstruction.
+    if (prebloom_set >= 0 && return_address == MOD_MAIN_BASE + 0x28cac4) return DRAW_ROLE_SCENE_TONEMAP;
+    if (prebloom_set >= 0 && return_address == MOD_MAIN_BASE + 0xa06164) return DRAW_ROLE_SCENE_COMPOSITE;
     return 0;
 }
 
@@ -313,7 +313,7 @@ static void scene_bloom_schedule(Cpu *cpu) {
     int previous_bloom_scope = bloom_scope;
     bloom_scope = 0;
     if (vk_dlaa_prebloom_enabled() && scene_projection_enabled() && cfg_bool("REKARINA_DLAA") &&
-        vk_dlaa_available() && !vk_dlaa_fsr1() && !vk_dlaa_fsr3()) {
+        vk_dlaa_available() && !vk_dlaa_fsr1()) {
         plat_mutex_lock(&projection_lock);
         bloom_scope = owner && cpu->x[2] == owner && completed > invalidated &&
                       *(const uint8_t *)(uintptr_t)(owner + 8) == index &&

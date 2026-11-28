@@ -1,10 +1,12 @@
 """Writes runtime/fsr_scene_spv.h: the SPIR-V of the two passes around FSR 1 when it scales the 3D scene (vk_fsr.c
 vk_fsr_scene), assembled here like tools/make_dlaa_mask.py (no GLSL compiler on the machine this was written on).
 
-EASU and RCAS (runtime/shaders/fsr_easu.comp, fsr_rcas.comp) expect a picture in perceptual space with values in 0..1;
-the scene's light target is linear light above 1 in highlights. The encode pass maps it into 0..1 with the reversible
+EASU (runtime/shaders/fsr_easu.comp) filters perceptual values. TotK's scene light can exceed 1; its encode pass maps
+it into 0..1 with the reversible
 tonemap AMD's FidelityFX documentation gives for its upscalers, c / (1 + max(r, g, b)), and the decode pass undoes it
 on the scaled picture in place, c / (1 - max(r, g, b)). Both keep the hue (one factor for the three channels).
+OoT instead starts from the tone-mapped picture: signed square root encodes it, and v * abs(v) decodes it.
+For PsychoV35 HDR the working primaries are BT.2020, with no upper clamp, and the output is signed linear BT.709.
 
 As GLSL:
 
@@ -50,9 +52,10 @@ OpTypeStruct, OpTypePointer, OpTypeFunction = 30, 32, 33
 OpConstant, OpConstantComposite, OpVariable, OpFunction, OpFunctionEnd, OpLabel, OpReturn = 43, 44, 59, 54, 56, 248, 253
 OpLoad, OpAccessChain, OpVectorShuffle, OpCompositeExtract, OpCompositeConstruct = 61, 65, 79, 81, 80
 OpImage, OpImageFetch, OpImageRead, OpImageWrite, OpConvertUToF, OpBitcast = 100, 95, 98, 99, 112, 124
-OpFAdd, OpFSub, OpVectorTimesScalar, OpFDiv, OpFOrdLessThan, OpLogicalAnd = 129, 131, 142, 136, 184, 167
+OpFAdd, OpFSub, OpFMul, OpVectorTimesScalar, OpFDiv, OpFOrdLessThan, OpLogicalAnd = 129, 131, 133, 142, 136, 184, 167
+OpDot, OpSelect, OpFOrdGreaterThan = 148, 169, 186
 OpSelectionMerge, OpBranchConditional, OpBranch = 247, 250, 249
-FMax = 40   # GLSL.std.450
+FAbs, FSign, Sqrt, FMax = 4, 6, 31, 40   # GLSL.std.450
 UniformConstant, Input, PushConstant = 0, 1, 9
 Binding, DescriptorSet, Block, Offset, BuiltIn, NonReadable = 33, 34, 2, 35, 11, 25
 GlobalInvocationId = 28
@@ -89,7 +92,7 @@ def f32(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
 
-def build(decode):
+def build(decode, perceptual=False):
     """The encode pass (decode False) or the decode pass, as SPIR-V words."""
     a = Asm()
     a.op('cap', OpCapability, 1)   # Shader
@@ -143,6 +146,22 @@ def build(decode):
     a.op(T, OpConstant, t_f, c_one, f32(1.0))
     a.op(T, OpConstant, t_f, c_floor, f32(1.0 / 1024.0))
     a.op(T, OpConstantComposite, t_v3, c_zero3, c_zero, c_zero, c_zero)
+    if perceptual:
+        t_b3 = a.id()
+        a.op(T, OpTypeVector, t_b3, t_bool, 3)
+        matrix = ((1.660491002, -0.587641139, -0.072849863),
+                  (-0.124550475, 1.132899897, -0.008349422),
+                  (-0.018150763, -0.100578898, 1.118729661)) if decode else (
+                      (0.627403896, 0.329283038, 0.043313066),
+                      (0.069097289, 0.919540396, 0.011362315),
+                      (0.016391439, 0.088013308, 0.895595253))
+        rows = []
+        for row in matrix:
+            channels = [a.id() for _ in row]
+            for channel, value in zip(channels, row):
+                a.op(T, OpConstant, t_f, channel, f32(value))
+            rows.append(a.id())
+            a.op(T, OpConstantComposite, t_v3, rows[-1], *channels)
     if not decode:
         a.op(T, OpVariable, t_psimg, v_src, UniformConstant)
     a.op(T, OpVariable, t_pwimg, v_img, UniformConstant)
@@ -183,13 +202,29 @@ def build(decode):
     else:
         img = ins(OpImage, t_img, ins(OpLoad, t_simg, v_src))
         texel = ins(OpImageFetch, t_v4, img, c, 2, c_i0)   # Lod 0
-    v = ext(t_v3, FMax, ins(OpVectorShuffle, t_v3, texel, texel, 0, 1, 2), c_zero3)
-    m = maxc(v)
-    if decode:
-        k = ins(OpFDiv, t_f, c_one, ext(t_f, FMax, ins(OpFSub, t_f, c_one, m), c_floor))
+    v = ins(OpVectorShuffle, t_v3, texel, texel, 0, 1, 2)
+    if perceptual:
+        mode = ins(OpCompositeExtract, t_f, p, 2)
+        hdr = ins(OpFOrdGreaterThan, t_bool, mode, c_zero)
+        hdr3 = ins(OpCompositeConstruct, t_b3, hdr, hdr, hdr)
+
+        def convert(v):
+            return ins(OpCompositeConstruct, t_v3, *(ins(OpDot, t_f, v, row) for row in rows))
+
+        if not decode:
+            v = ins(OpSelect, t_v3, hdr3, ext(t_v3, FMax, convert(v), c_zero3), v)
+        mag = ext(t_v3, FAbs, v)
+        s = ins(OpFMul, t_v3, v, mag) if decode else ins(OpFMul, t_v3, ext(t_v3, FSign, v), ext(t_v3, Sqrt, mag))
+        if decode:
+            s = ins(OpSelect, t_v3, hdr3, convert(s), s)
     else:
-        k = ins(OpFDiv, t_f, c_one, ins(OpFAdd, t_f, c_one, m))
-    s = ins(OpVectorTimesScalar, t_v3, v, k)
+        v = ext(t_v3, FMax, v, c_zero3)
+        m = maxc(v)
+        if decode:
+            k = ins(OpFDiv, t_f, c_one, ext(t_f, FMax, ins(OpFSub, t_f, c_one, m), c_floor))
+        else:
+            k = ins(OpFDiv, t_f, c_one, ins(OpFAdd, t_f, c_one, m))
+        s = ins(OpVectorTimesScalar, t_v3, v, k)
     out = ins(OpCompositeConstruct, t_v4, ins(OpCompositeExtract, t_f, s, 0), ins(OpCompositeExtract, t_f, s, 1),
               ins(OpCompositeExtract, t_f, s, 2), c_one)
     a.op(F, OpImageWrite, ins(OpLoad, t_wimg, v_img), c, out)
@@ -206,8 +241,10 @@ def array(name, w):
 
 
 enc, dec = build(False), build(True)
+root, square = build(False, True), build(True, True)
 OUT.write_text(
     '// Generated by tools/make_fsr_scene.py: the encode and decode passes around FSR 1 on the scene (vk_fsr.c\n'
     '// vk_fsr_scene). Do not edit.\n#pragma once\n#include <stdint.h>\n' +
-    array('fsr_scene_encode_spv', enc) + array('fsr_scene_decode_spv', dec), newline='\n')
-print(f'{OUT}: {len(enc)} + {len(dec)} words')
+    '#ifdef GAME_OOT\n' + array('fsr_scene_encode_spv', root) + array('fsr_scene_decode_spv', square) +
+    '#else\n' + array('fsr_scene_encode_spv', enc) + array('fsr_scene_decode_spv', dec) + '#endif\n', newline='\n')
+print(f'{OUT}: {len(root)} + {len(square)} words (OoT), {len(enc)} + {len(dec)} words (TotK)')

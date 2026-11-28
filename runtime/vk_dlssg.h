@@ -20,9 +20,8 @@ VkResult vk_dlssg_enumerate(VkInstance inst, uint32_t *n, VkPhysicalDevice *pd);
 PFN_vkVoidFunction vk_dlssg_instance_proc(VkInstance inst, const char *name);   // the interposer's, or NULL
 VkResult vk_dlssg_create_device(VkInstance inst, VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out);
 void vk_dlssg_device_ready(VkDevice dev);   // after the device: checks DLSS SR & DLSS-G and takes the swapchain hooks
-int vk_dlssg_swapchain_ready(void);         // Streamline swapchain hooks are ready for live selection
-int vk_dlssg_owns_swapchain(void);          // Streamline is the active swapchain owner (yields while AMD owns it)
-int vk_dlssg_active(void);                  // Streamline owns the swapchain AND REKARINA_FRAMEGEN == dlss
+int vk_dlssg_swapchain_ready(void);         // Streamline owns the swapchain hooks (DLSS-G can toggle live)
+int vk_dlssg_active(void);                  // swapchain ready AND REKARINA_FRAMEGEN == dlss
 int vk_dlssg_reflex_available(void);        // Streamline's sl.reflex owns Reflex on its swapchain
 void vk_dlssg_reflex_sync(void);            // applies live REKARINA_REFLEX changes to Streamline's swapchain
 // Why DLSS Frame Generation is not running although REKARINA_FRAMEGEN was dlss at start (for the menu's row), else NULL

@@ -5222,6 +5222,7 @@ void vk_mem_prologue_submitted(uint64_t value) {
 
 void vk_mem_mirror_prologue(VkCommandBuffer cb) {
     if (!npend && snl_copied == nsnl) return;
+    const int has_uploads = npend != 0;
     for (int i = 0; nawbr && i < npend; i++) awb_check(pend[i].r, pend[i].off, pend[i].size);   // async write-back
     if (copy_guard_on())
         for (int i = 0; i < npend; i++) {
@@ -5257,8 +5258,8 @@ void vk_mem_mirror_prologue(VkCommandBuffer cb) {
         copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
     }
     if (snl_copied < nsnl) {   // the snapshots read what the uploads above wrote
-        if (npend) mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
-                            VK_ACCESS_2_TRANSFER_READ_BIT);
+        if (has_uploads) mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                                  VK_ACCESS_2_TRANSFER_READ_BIT);
         snap_copies(cb);
     }
     mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -6055,7 +6056,7 @@ typedef struct { VkBuffer buf; VmaAllocation alloc; } Staging;
 typedef struct {
     VkCommandBuffer cb;
     VkFence fence;
-    uint64_t seq;
+    uint64_t seq, submit_ticket;
     Staging *stg;
     int nstg, cap;
     int ub;   // REKARINA_SECTIONS: the batch's timestamp pair + 1, 0 none
@@ -6439,8 +6440,14 @@ static void retire(VkCtx *c, int wait_all) {
     int k = 0;
     for (; k < ninflight; k++) {
         Batch *b = &inflight[k];
-        if (wait_all) vkWaitForFences(c->device, 1, &b->fence, VK_TRUE, UINT64_MAX);
-        else if (vkGetFenceStatus(c->device, b->fence) != VK_SUCCESS) break;
+        // Queueing the upload is not enough: the submitter still owns the fence inside vkQueueSubmit2.
+        if (!vk_sync_upload_submitted(b->submit_ticket, wait_all)) break;
+        VkResult r = wait_all ? vkWaitForFences(c->device, 1, &b->fence, VK_TRUE, UINT64_MAX)
+                              : vkGetFenceStatus(c->device, b->fence);
+        if (r != VK_SUCCESS) {
+            if (r != VK_NOT_READY) vk_device_fault_report(r);
+            break;
+        }
         if (b->ub) ub_read(c, b);
         free_staging(c, b);
         done_seq = b->seq;
@@ -6671,9 +6678,9 @@ uint64_t vk_upload_flush(int wait) {
         vk_crumb(open_b.cb, VK_CRUMB_UPLOAD_END, open_b.seq);
         vkEndCommandBuffer(open_b.cb);
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &open_b.cb};
-        int vk_sync_submit_upload(VkCommandBuffer cb, VkFence vkfence);
         VkResult r = VK_SUCCESS;
-        if (!vk_sync_submit_upload(open_b.cb, open_b.fence)) {   // queued behind the parts already queued (vk_sync.c)
+        open_b.submit_ticket = vk_sync_submit_upload(open_b.cb, open_b.fence);
+        if (!open_b.submit_ticket) {
             vk_queue_lock();
             r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
             vk_queue_unlock();
@@ -6688,7 +6695,12 @@ uint64_t vk_upload_flush(int wait) {
     }
     if (c && wait) {
         while (ninflight && done_seq < seq) {
-            vkWaitForFences(c->device, 1, &inflight[0].fence, VK_TRUE, UINT64_MAX);
+            vk_sync_upload_submitted(inflight[0].submit_ticket, 1);
+            VkResult r = vkWaitForFences(c->device, 1, &inflight[0].fence, VK_TRUE, UINT64_MAX);
+            if (r != VK_SUCCESS) {
+                vk_device_fault_report(r);
+                rt_fatal("vk: waiting for an upload fence failed (%d)", (int)r);
+            }
             retire(c, 0);
         }
     }

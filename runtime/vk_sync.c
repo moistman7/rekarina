@@ -304,10 +304,18 @@ int vk_sync_awb_on(void) {
     return 1;
 }
 
+static uint64_t timeline_counter(VkDevice device, VkSemaphore sem) {
+    uint64_t value;
+    VkResult r = vkGetSemaphoreCounterValue(device, sem, &value);
+    if (r == VK_SUCCESS && value != UINT64_MAX) return value;
+    // NVIDIA can return success with all bits set after device loss. It is not completion.
+    vk_device_fault_report(r == VK_SUCCESS ? VK_ERROR_DEVICE_LOST : r);
+    if (r == VK_SUCCESS) rt_fatal("vk: timeline counter reads UINT64_MAX (device lost)");
+    rt_fatal("vk: vkGetSemaphoreCounterValue failed (%d)", (int)r);
+}
+
 uint64_t vk_sync_awb_done(void) {
-    uint64_t v = 0;
-    if (awb_mode > 0) vkGetSemaphoreCounterValue(vk_ctx()->device, awb_sem, &v);
-    return awb_mode > 0 ? v : UINT64_MAX;
+    return awb_mode > 0 ? timeline_counter(vk_ctx()->device, awb_sem) : UINT64_MAX;
 }
 
 static int awb_wait(uint64_t v, uint64_t timeout) {
@@ -461,8 +469,8 @@ static void completion_main(void *arg) {
                 rt_fatal("vk: vkWaitSemaphores failed (%d; device lost?)", (int)r);
             }
             // results first: a results value implies every earlier submission's own value, read after it
-            if (res_on) vkGetSemaphoreCounterValue(c->device, res_sem, &rreached);
-            vkGetSemaphoreCounterValue(c->device, c->timeline, &reached);
+            if (res_on) rreached = timeline_counter(c->device, res_sem);
+            reached = timeline_counter(c->device, c->timeline);
             FT(FT_NOTE, 11, reached, rreached);
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
@@ -661,8 +669,7 @@ void vk_sync_start(void) {
         }
         if (!ts_state && perf_gpu_timing()) ts_setup(c);
         perf_gpu_stats = gpu_stats;
-        uint64_t now = 0;
-        vkGetSemaphoreCounterValue(c->device, c->timeline, &now);
+        uint64_t now = timeline_counter(c->device, c->timeline);
         if (issued > now) {   // a new device after vk_shutdown: values keep increasing for the front end
             VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = c->timeline,
                                         .value = issued};
@@ -687,23 +694,7 @@ void vk_sync_start(void) {
 // The index of a command buffer the GPU no longer uses, claimed for value `fence`. Called with sub_lock held; may move
 // slots[].
 static int claim_slot(VkCtx *c, uint64_t fence) {
-    uint64_t gpu = 0, sub = __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
-    VkResult cr = vkGetSemaphoreCounterValue(c->device, c->timeline, &gpu);
-    // A lost device answers with an error, and NVIDIA's driver with the counter at its largest value (vk_memory.c
-    // collect_locked). Taken at its word, every slot looks free and every claim takes the first slot, begun again
-    // (which resets it) for each command buffer asked for: the chunks' command buffers of a draw stretch among them,
-    // while other threads still record the chunks of the stretch before (vk_sync_chain_ex hands out the next
-    // stretch's with those out), so one command buffer goes to several threads at once. A chunk's next call into it
-    // then meets a command buffer that is not recording: an access violation inside the driver in place of the device
-    // loss's report. No value past the newest one submitted can have been reached, as the completion thread knows
-    // (completion_main caps what it reads): such an answer frees no slot.
-    if (cr != VK_SUCCESS || gpu > sub) {
-        static int said;
-        if (!said) said = 1,
-            rt_log("vk: the timeline counter reads %llu (result %d), the newest value submitted is %llu: the device is lost; "
-                   "no command buffer slot is taken as free", (unsigned long long)gpu, (int)cr, (unsigned long long)sub);
-        gpu = 0;
-    }
+    uint64_t gpu = timeline_counter(c->device, c->timeline);
     for (int i = 0; i < nslots; i++)
         if (slots[i].fence <= gpu) {
             slots[i].fence = fence;
@@ -728,9 +719,7 @@ static int claim_slot(VkCtx *c, uint64_t fence) {
 static VkSemaphore pro_sem;
 static uint64_t pro_val;
 static uint64_t pro_done(void) {
-    uint64_t v = 0;
-    if (pro_sem) vkGetSemaphoreCounterValue(vk_ctx()->device, pro_sem, &v);
-    return v;
+    return pro_sem ? timeline_counter(vk_ctx()->device, pro_sem) : 0;
 }
 static int pro_wait(uint64_t v) {
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &pro_sem,
@@ -841,7 +830,7 @@ static void sq_main(void *arg) {
             rt_fatal("vk: vkQueueSubmit2 of value %llu failed (%d)", (unsigned long long)j->fence, (int)r);
         }
         plat_mutex_lock(&sq_lock);
-        sq_done++;
+        __atomic_store_n(&sq_done, sq_done + 1, __ATOMIC_RELEASE);
         if (sq_done == sq_put) plat_cond_broadcast(&sq_idle);
         plat_cond_broadcast(&sq_work);   // a producer waiting for room
     }
@@ -921,7 +910,7 @@ static VkResult submit_batches(VkCtx *c, uint32_t n, const VkSubmitInfo2 *si, ui
 // waits until the submitter has handed every queued part to the driver (+1.4 ms in the forest's slowest frames, the
 // replay thread off the processor inside its submission). 0: not queued (no submitter thread, or
 // REKARINA_UPLOAD_QUEUED=0): the caller submits it itself.
-int vk_sync_submit_upload(VkCommandBuffer cb, VkFence vkfence) {
+uint64_t vk_sync_submit_upload(VkCommandBuffer cb, VkFence vkfence) {
     static int on = -1;
     if (on < 0) on = rt_knob("UPLOAD_QUEUED", "1");
     if (!on || !sq_enabled() || sq_me) return 0;
@@ -931,8 +920,17 @@ int vk_sync_submit_upload(VkCommandBuffer cb, VkFence vkfence) {
     j->n = 1, j->fence = 0, j->ended = NULL, j->vkfence = vkfence;
     j->cbi[0][0] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb};
     j->si[0] = (VkSubmitInfo2){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = 1, .pCommandBufferInfos = j->cbi[0]};
-    sq_put++;
+    const uint64_t ticket = ++sq_put;
     plat_cond_broadcast(&sq_work);
+    plat_mutex_unlock(&sq_lock);
+    return ticket;
+}
+
+int vk_sync_upload_submitted(uint64_t ticket, int wait) {
+    if (!ticket || __atomic_load_n(&sq_done, __ATOMIC_ACQUIRE) >= ticket) return 1;
+    if (!wait) return 0;
+    plat_mutex_lock(&sq_lock);
+    while (sq_done < ticket) plat_cond_wait(&sq_work, &sq_lock);
     plat_mutex_unlock(&sq_lock);
     return 1;
 }

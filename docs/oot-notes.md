@@ -3983,7 +3983,8 @@ draws into that picture (the HUD's) or, in a frame without HUD, into the window 
 (`gfx_present.c` hudless_record) the copy takes the same path as the game's picture (picture_into: the colour
 profile or the HDR10 encode, then FSR or the blit), with source views of its own (the slots after FRAMES). The
 upscaler's history resets (another scene size, no camera, another scene target) now reach both frame generations
-(`vk_dlaa_fg_inputs` reset; it was always 0). Test knobs: `REKARINA_FG_HUDLESS_AT_DLSS=1` (the old copy point),
+(`vk_dlaa_fg_inputs` reset; it was always 0). Historical test knob: `REKARINA_FG_HUDLESS_AT_DLSS=1` (the old copy point,
+no longer used by OoT, which captures after scene sharpening),
 `REKARINA_FG_HUDLESS_PLAIN=1` (the old plain blit at the present); `REKARINA_HL_SHOT=lo-hi:step` saves the presented
 frame (`sc<frame>.png`) and the HUD-less picture of the same present (`hl<frame>.png`).
 

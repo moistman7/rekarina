@@ -40,8 +40,9 @@ void gfx_present_reflex_frame(uint64_t id);
 
 #define WEAK __attribute__((weak))
 
-typedef struct { VkImage image; VkFormat format; GfxOutputEncoding encoding; int w, h, has_crop, crop[4];
-                 uint64_t frame, at, queued, value, reflex_id; VkGuestPq pq; const CfgRenderState *settings; } PresentJob;
+typedef struct { VkImage image; VkFormat format; int w, h, has_crop, crop[4];
+                 uint64_t frame, at, queued, value, reflex_id; VkGuestPq pq; const CfgRenderState *settings;
+                 const char *nvidia_scene_aa; } PresentJob;
 
 static PlatMutex pl = PLAT_MUTEX_INIT;
 static PlatCond pcv = PLAT_COND_INIT;   // job queued, job taken, job submitted
@@ -100,7 +101,7 @@ static void present_main(void *arg) {
         gfx_present_reflex_frame(j.reflex_id);
         gfx_blit_frame(j.frame);   // DEBUG-PACELOG: the blit's moments and GPU timestamp
         int tagged = vk_present_blit(j.image, VK_IMAGE_LAYOUT_GENERAL, j.format, j.w, j.h,
-                                     j.has_crop ? j.crop : NULL, j.encoding);
+                                     j.has_crop ? j.crop : NULL, &j.pq, j.nvidia_scene_aa);
         // Retire tagged inputs after the actual present, not the blit. Streamline's default mode orders its work
         // on the presenting queue, so the post-present timeline also protects deferred destruction.
         uint64_t f = tagged ? 0 : present_release(&j);
@@ -115,7 +116,7 @@ static void present_main(void *arg) {
         if (j.image) vk_completion_add(f, frame_blit_done, (void *)(uintptr_t)j.frame);   // the frame clock (perf.c)
         cfg_render_use(previous_settings);
         cfg_render_release(j.settings);
-        cfg_render_publish();
+        cfg_render_publish_present(vk_dlaa_resolve_consumers);
         // REKARINA_TRACE=present: one line per present: the host present's interval, the interval of the game's present
         // calls (when the host present went out before back-edge pacing), the wait and how far past its target it went
         if (rt_trace & RT_TRACE_PRESENT)
@@ -163,36 +164,25 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
         return;
     }
     PresentJob j = {.image = img->image, .format = img->format, .w = (int)img->width, .h = (int)img->height, .frame = frame,
-                    .at = at_ns, .queued = queued, .value = value, .reflex_id = vk_reflex_current_id(), .encoding = encoding};
+                    .at = at_ns, .queued = queued, .value = value, .reflex_id = vk_reflex_current_id()};
 #ifdef GAME_OOT
     GfxOutputEncoding written = vk_hdr_written_output(img->serial, frame, &j.pq);
-    if (rt_trace & RT_TRACE_GFX) {
-        static GfxOutputEncoding last_request, last_written;
-        static int last_pq_valid;
-        if (encoding != last_request || written != last_written || j.pq.valid != last_pq_valid) {
-            rt_log("gfx: frame %llu guest encoding request %d, written %d, PQ transform %s",
-                   (unsigned long long)frame, (int)encoding, (int)written, j.pq.valid ? "available" : "unavailable");
-            last_request = encoding;
-            last_written = written;
-            last_pq_valid = j.pq.valid;
-        }
-    }
-    static GfxOutputEncoding previous_output;
-    if (written != GFX_OUTPUT_UNSPECIFIED) previous_output = written;
-    vk_hdr_output_set_guest_pq(encoding == GFX_OUTPUT_PQ || previous_output == GFX_OUTPUT_PQ);
-    j.encoding = written;
-    if (written == GFX_OUTPUT_UNSPECIFIED && (encoding == GFX_OUTPUT_PQ || previous_output == GFX_OUTPUT_PQ)) {
-        j.image = VK_NULL_HANDLE;
-    } else if (written != GFX_OUTPUT_PQ) {
-        vk_hdr_present_source(img, &j.image, &j.format);
+    static GfxOutputEncoding last_request, last_written;
+    if ((rt_trace & RT_TRACE_GFX) && (encoding != last_request || written != last_written)) {
+        rt_log("gfx: frame %llu guest encoding request %d, written %d", (unsigned long long)frame, (int)encoding, (int)written);
+        last_request = encoding;
+        last_written = written;
     }
 #else
+    (void)encoding;
     vk_hdr_present_source(img, &j.image, &j.format);
 #endif
-    if (vk_interface_coverage_enabled() || vk_dlaa_prebloom_enabled()) {
+    if (vk_interface_coverage_enabled() ||
+        (vk_dlaa_prebloom_enabled() && (vk_dlaa_active() || vk_dlaa_fg_only()))) {
         vk_present_drain();
         vk_dlaa_seal_scene(frame, img->image, j.image, img->serial);
     }
+    j.nvidia_scene_aa = vk_dlaa_nvidia_scene_aa();
     vk_dlaa_frame();
     if (crop) {
         j.has_crop = 1;
@@ -280,9 +270,9 @@ static uint64_t ck_reads, ck_diff, ck_diff_unexplained, ck_diff_idle;
 int vk_replay_async(void) {
     static int on = -1;
     if (on < 0) {
-        // Off by default. Where the game waits for the GPU it overlaps the replay with the game threads (a GTX 1650 in
+        // Where the game waits for the GPU it overlaps the replay with the game threads (a GTX 1650 in
         // the Depths went from 450-686 frames over 50 ms a minute to 10-13, issue #88), the only place a gain was
-        // measured. While it was the default, a GTX 1660 Ti at the 60 fps cap with the GPU at 26 % reported uneven
+        // measured. With it enabled, a GTX 1660 Ti at the 60 fps cap with the GPU at 26 % reported uneven
         // motion that 0.3.4 did not have (#659). It adds up to a frame of latency.
         on = cfg_bool("REKARINA_REPLAY_ASYNC");
         rt_log("vk: replay %s (REKARINA_REPLAY_ASYNC=%d)",
@@ -815,7 +805,7 @@ static void vk_be_cpu_synced(uint64_t fence) {
 static void vk_be_frame_start(void) {
     // Pin the last published settings without waiting for Present; a live edit can arrive a frame later.
     cfg_render_frame_begin();
-    if (vk_dlssg_owns_swapchain()) vk_dlssg_frame_start();
+    if (vk_dlssg_swapchain_ready()) vk_dlssg_frame_start();
     else vk_reflex_frame_start();
 }
 

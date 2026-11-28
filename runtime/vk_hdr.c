@@ -1,15 +1,9 @@
 // HDR output (REKARINA_HDR=1 or native): an HDR10 swapchain (Rec. 2020 primaries, ST 2084 PQ) and a game picture tone
 // mapped to the display's range (shaders/hdr_tonemap.frag on OoT, shaders/hdr_tonemap_totk.frag on TotK).
 //
-// On OoT (GAME_OOT):
-// - REKARINA_HDR = 0 | 1 | native. With REKARINA_HDR_LIVE = 1 (default), HDR extensions, SPIR-V splicing and the
-//   extended support buffer are armed from startup so the menu can switch between SDR (0) and RenoDX HDR (1) live
-//   without a restart. While the swapchain is SDR, vk_hdr_support passes p0.w = -1 so the spliced tonemap outputs the
-//   game's exact vanilla SDR curve.
-// - REKARINA_HDR = native reports an HDR10 display through nn::vi::QueryDisplayHdrStatus (ns2_host.c); the game renders
-//   and encodes PQ Rec. 2020 directly into an A2B10G10R10 picture, which passes straight to the HDR10 swapchain.
-// - Tone mappers (REKARINA_HDR_TONEMAP): psychov35 (observer-response cone mapper, default), renodrt (Daniele luminance
-//   mapper + OkLab grading), and vanilla (game ACES curve scaled to game brightness).
+// On OoT (GAME_OOT), the guest selects SDR or HDR10 and writes the visible output. Native HDR leaves scene mapping
+// untouched; RenoDX HDR uses a separate in-memory scene variant for the checked HDR compose.
+// - Tone mappers (REKARINA_HDR_TONEMAP): psychov35 (observer-response cone mapper, default) and vanilla (guest ACES).
 // - Present pass (vk_hdr_encode, shaders/hdr_encode.comp): optional colour profile (vk_color.c), RenoDX gamma correction
 //   (REKARINA_HDR_GAMMA: 2.2 / 2.4 / off), Rec. 709 -> Rec. 2020, mid-grey gamut compression, UI nits scaling,
 //   ratio-preserving peak clamp, and PQ encode.
@@ -44,50 +38,50 @@
 // ---- settings & lifecycle
 
 #ifdef GAME_OOT
-static int g_armed = -1, g_native = -1;
+static int g_disabled;
 
-static void hdr_start(void) {
-    if (g_armed >= 0) return;
-    g_native = !strcmp(cfg_value("REKARINA_HDR"), "native");
-    g_armed = g_native || cfg_bool("REKARINA_HDR") || cfg_bool("REKARINA_HDR_LIVE");
+int vk_hdr_armed(void) { return !g_disabled; }
+
+static int hdr_mode(void) {
+    static _Thread_local unsigned seen = ~0u;
+    static _Thread_local int mode;
+    if (!vk_hdr_armed()) return 0;
+    unsigned v = cfg_version();
+    if (seen != v) {
+        const char *setting = cfg_value("REKARINA_HDR");
+        mode = !strcmp(setting, "1") ? (!strcmp(cfg_value("REKARINA_HDR_TONEMAP"), "vanilla") ? 2 : 1) : 0;
+        seen = v;
+    }
+    return mode;
 }
 
-int vk_hdr_armed(void) {
-    hdr_start();
-    return g_armed;
+int vk_hdr_native(void) { return hdr_mode() == 2; }
+int vk_hdr_wanted(void) { return hdr_mode() != 0; }
+
+static unsigned renodx_flags(void) {
+    const CfgRenderValues *settings = cfg_render_values();
+    return settings && vk_hdr_active() && vk_hdr_armed() ? settings->renodx_flags : 0;
 }
 
-int vk_hdr_native(void) { return vk_hdr_armed() && g_native; }
+int vk_hdr_renodx_scene(void) {
+    return (renodx_flags() & CFG_HDR_RENODX_SCENE) != 0;
+}
+
+int vk_hdr_renodx_effects(void) {
+    return (renodx_flags() & CFG_HDR_RENODX_EFFECTS) != 0 || cfg_double("REKARINA_HDR_BLOOM") != 50.0;
+}
 
 int vk_hdr_native_picture(VkFormat fmt) {
-    return vk_hdr_native() &&
+    return vk_hdr_wanted() &&
            (fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
 }
 
-int vk_hdr_wanted(void) {
-    static unsigned seen = ~0u;
-    static int on;
-    if (!vk_hdr_armed()) return 0;
-    if (g_native) return 1;
-    unsigned v = cfg_version();
-    if (__atomic_load_n(&seen, __ATOMIC_ACQUIRE) != v) {
-        __atomic_store_n(&on, cfg_bool("REKARINA_HDR") != 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&seen, v, __ATOMIC_RELEASE);
-    }
-    return __atomic_load_n(&on, __ATOMIC_ACQUIRE);
-}
-
-int vk_hdr_needs_restart(void) {
-    hdr_start();
-    return (!strcmp(cfg_value("REKARINA_HDR"), "native")) != g_native || (!g_armed && cfg_bool("REKARINA_HDR"));
-}
-
 int vk_hdr_adaptation_supported(void) {
-    VkCtx *ctx = vk_ctx();
+    const VkCtx *ctx = vk_ctx();
     return ctx && ctx->has_fragment_stores;
 }
 
-void vk_hdr_off(void) { g_native = 0, g_armed = 0; }
+void vk_hdr_off(void) { g_disabled = 1; }
 #else
 static int g_wanted = -1;
 
@@ -99,7 +93,6 @@ int vk_hdr_wanted(void) {
 int vk_hdr_armed(void) { return vk_hdr_wanted(); }
 int vk_hdr_native(void) { return 0; }
 int vk_hdr_native_picture(VkFormat fmt) { (void)fmt; return 0; }
-int vk_hdr_needs_restart(void) { return 0; }
 void vk_hdr_off(void) { g_wanted = 0; }
 #endif
 
@@ -109,80 +102,92 @@ void vk_hdr_off(void) { g_wanted = 0; }
 typedef struct {
     float peak, game, ui;   // nits
     float gamma;            // 0 off, 1: 2.2, 2: 2.4
-    float p3;               // 1: the picture's primaries are read as Display P3 (REKARINA_HDR_COLOR_SPACE)
 #ifdef GAME_OOT
+    float ui_eotf;
     float adaptation_target, adaptation_min, adaptation_max;
 #endif
     float tm[4 * VK_HDR_PARAMS];   // support buffer parameters (from byte VK_HDR_PARAMS_AT)
 } Nits;
-static struct { unsigned seen; int cur; Nits snap[2]; PlatMutex lock; } N = {.seen = ~0u, .lock = PLAT_MUTEX_INIT};
-
 static float clampf(float v, float lo, float hi) { return fminf(fmaxf(v, lo), hi); }
+static float eotf_code(const char *setting) {
+    return !strcmp(setting, "off") || !strcmp(setting, "0") ? 0.0f : !strcmp(setting, "2.4") ? 2.0f : HDR_GAMMA_22;
+}
+
+static void nits_read(Nits *n) {
+    memset(n, 0, sizeof *n);
+    n->peak = clampf((float)cfg_double("REKARINA_HDR_PEAK_NITS"), 80.0f, 10000.0f);
+    n->game = clampf((float)cfg_double("REKARINA_HDR_GAME_NITS"), 48.0f, 500.0f);
+    n->ui = clampf((float)cfg_double("REKARINA_HDR_UI_NITS"), 48.0f, 500.0f);
+    n->gamma = vk_hdr_native() ? HDR_GAMMA_22 : eotf_code(cfg_value("REKARINA_HDR_GAMMA"));
+#ifdef GAME_OOT
+    n->ui_eotf = eotf_code(cfg_value("REKARINA_HDR_UI_EOTF"));
+    const char *tm = cfg_value("REKARINA_HDR_TONEMAP");
+    float mapper = !strcmp(tm, "vanilla") ? 0.0f : 9.0f;
+    static const char *const keys[] = {
+        "REKARINA_HDR_HIGHLIGHTS", "REKARINA_HDR_SHADOWS", "REKARINA_HDR_CONTRAST",
+        "REKARINA_HDR_SATURATION", "REKARINA_HDR_TONE_SLOPE", "REKARINA_HDR_HUE_CLIP"};
+    float pct[sizeof keys / sizeof *keys];
+    for (unsigned i = 0; i < sizeof keys / sizeof *keys; i++) pct[i] = clampf((float)cfg_double(keys[i]), 0.0f, 100.0f);
+    float *t = n->tm;
+    t[0] = n->peak, t[1] = n->game, t[2] = n->game, t[3] = mapper;
+    t[4] = clampf((float)cfg_double("REKARINA_HDR_EXPOSURE"), 0.0f, 800.0f) / 100.0f;
+    t[5] = pct[0] / 50.0f, t[6] = pct[1] / 50.0f, t[7] = pct[2] / 50.0f;
+    t[8] = pct[3] / 50.0f;
+    t[14] = n->gamma, t[15] = pct[4] / 50.0f;
+    t[16] = pct[5] / 100.0f;
+    const char *midgray = cfg_value("REKARINA_HDR_MIDGRAY");
+    t[17] = !strcmp(midgray, "render") ? 0.0f : mapper == 9.0f && !strcmp(midgray, "adaptation") ? 2.0f : 1.0f;
+    n->adaptation_target = clampf((float)cfg_double("REKARINA_HDR_ADAPTATION_TARGET"), 1.0f, 100.0f) / 100.0f;
+    n->adaptation_min = exp2f(clampf((float)cfg_double("REKARINA_HDR_ADAPTATION_MIN_STOPS"), -8.0f, 0.0f));
+    n->adaptation_max = exp2f(clampf((float)cfg_double("REKARINA_HDR_ADAPTATION_MAX_STOPS"), 0.0f, 8.0f));
+    t[18] = cfg_bool("REKARINA_HDR_MATCH_SLOPE") ? 1.0f : 0.0f, t[19] = 0.0f;
+    t[20] = clampf((float)cfg_double("REKARINA_HDR_BLOOM"), 0.0f, 100.0f) / 50.0f;   // 50: the game's bloom
+    t[21] = mapper == 0.0f ? clampf((float)cfg_double("REKARINA_HDR_LOCAL_EXPOSURE"), 0.0f, 100.0f) / 50.0f : 0.0f;
+#else
+    n->tm[0] = n->game / n->ui;
+    n->tm[1] = n->peak > n->game ? n->peak / n->game : 1.0f;
+    n->tm[2] = clampf((float)cfg_double("REKARINA_HDR_HUE"), 0.0f, 100.0f) / 100.0f;
+    n->tm[3] = 0.0f;
+#endif
+}
 
 static Nits nits(void) {
+    static _Thread_local unsigned seen = ~0u;
+    static _Thread_local Nits current;
     unsigned v = cfg_version();
-    if (__atomic_load_n(&N.seen, __ATOMIC_ACQUIRE) != v) {
-        plat_mutex_lock(&N.lock);
-        if (N.seen != v) {
-            Nits *n = &N.snap[!N.cur];
-            memset(n, 0, sizeof *n);
-            n->peak = clampf((float)cfg_double("REKARINA_HDR_PEAK_NITS"), 80.0f, 10000.0f);
-            n->game = clampf((float)cfg_double("REKARINA_HDR_GAME_NITS"), 48.0f, 500.0f);
-            n->ui = clampf((float)cfg_double("REKARINA_HDR_UI_NITS"), 48.0f, 500.0f);
-            const char *g = cfg_value("REKARINA_HDR_GAMMA");
-            n->gamma = vk_hdr_native() ? HDR_GAMMA_22
-                       : !strcmp(g, "off") || !strcmp(g, "0") ? 0.0f : !strcmp(g, "2.4") ? 2.0f : HDR_GAMMA_22;
-#ifdef GAME_OOT
-            n->p3 = !strcmp(cfg_value("REKARINA_HDR_COLOR_SPACE"), "p3");
-            const char *tm = cfg_value("REKARINA_HDR_TONEMAP");
-            float mapper = !strcmp(tm, "vanilla") ? 0.0f : !strcmp(tm, "renodrt") ? 3.0f : 9.0f;
-            static const char *const keys[10] = {
-                "REKARINA_HDR_HIGHLIGHTS", "REKARINA_HDR_SHADOWS", "REKARINA_HDR_CONTRAST",
-                "REKARINA_HDR_SATURATION", "REKARINA_HDR_HIGHLIGHT_SAT", "REKARINA_HDR_BLOWOUT",
-                "REKARINA_HDR_FLARE", "REKARINA_HDR_HUE", "REKARINA_HDR_TONE_SLOPE",
-                "REKARINA_HDR_HUE_CLIP"};
-            float pct[10];
-            for (int i = 0; i < 10; i++) pct[i] = clampf((float)cfg_double(keys[i]), 0.0f, 100.0f);
-            float *t = n->tm;
-            t[0] = n->peak, t[1] = n->game, t[2] = n->ui, t[3] = mapper;
-            t[4] = clampf((float)cfg_double("REKARINA_HDR_EXPOSURE"), 0.0f, 800.0f) / 100.0f;
-            t[5] = pct[0] / 50.0f, t[6] = pct[1] / 50.0f, t[7] = pct[2] / 50.0f;
-            t[8] = pct[3] / 50.0f, t[9] = pct[4] / 50.0f, t[10] = pct[5] / 100.0f, t[11] = pct[6] / 50.0f;
-            t[12] = pct[7] / 100.0f;
-            t[13] = clampf((float)cfg_double("REKARINA_HDR_GRADE"), 0.0f, 100.0f) / 100.0f;
-            t[14] = n->gamma, t[15] = pct[8] / 50.0f;
-            t[16] = pct[9] / 100.0f;
-            const char *midgray = cfg_value("REKARINA_HDR_MIDGRAY");
-            t[17] = !strcmp(midgray, "render") ? 0.0f : mapper == 9.0f && !strcmp(midgray, "adaptation") ? 2.0f : 1.0f;
-            n->adaptation_target = clampf((float)cfg_double("REKARINA_HDR_ADAPTATION_TARGET"), 1.0f, 100.0f) / 100.0f;
-            n->adaptation_min = exp2f(clampf((float)cfg_double("REKARINA_HDR_ADAPTATION_MIN_STOPS"), -8.0f, 0.0f));
-            n->adaptation_max = exp2f(clampf((float)cfg_double("REKARINA_HDR_ADAPTATION_MAX_STOPS"), 0.0f, 8.0f));
-            t[18] = cfg_bool("REKARINA_HDR_MATCH_SLOPE") ? 1.0f : 0.0f, t[19] = 0.0f;
-            t[20] = clampf((float)cfg_double("REKARINA_HDR_BLOOM"), 0.0f, 100.0f) / 50.0f;   // 50: the game's bloom
-            t[21] = mapper == 9.0f ? 1.0f
-                    : clampf((float)cfg_double("REKARINA_HDR_LOCAL_EXPOSURE"), 0.0f, 100.0f) / 50.0f;
-#else
-            n->tm[0] = n->game / n->ui;
-            n->tm[1] = n->peak > n->game ? n->peak / n->game : 1.0f;
-            n->tm[2] = clampf((float)cfg_double("REKARINA_HDR_HUE"), 0.0f, 100.0f) / 100.0f;
-            n->tm[3] = 0.0f;
-#endif
-            __atomic_store_n(&N.cur, !N.cur, __ATOMIC_RELEASE);
-            __atomic_store_n(&N.seen, v, __ATOMIC_RELEASE);
-        }
-        plat_mutex_unlock(&N.lock);
+    if (seen != v) {
+        nits_read(&current);
+        seen = v;
     }
-    return N.snap[__atomic_load_n(&N.cur, __ATOMIC_ACQUIRE)];
+
+    return current;
 }
+
+#ifdef GAME_OOT
+int vk_hdr_sdr_scene(void) {
+    return !vk_hdr_wanted() && !vk_hdr_active() && !strcmp(cfg_value("REKARINA_SDR_TONEMAP"), "psychov35");
+}
+
+int vk_hdr_scene_grade(void) {
+    Nits n = nits();
+    return n.tm[4] != 1.0f || n.tm[5] != 1.0f || n.tm[6] != 1.0f || n.tm[7] != 1.0f || n.tm[8] != 1.0f;
+}
+
+#endif
 
 void vk_hdr_support(float out[4 * VK_HDR_PARAMS]) {
     Nits n = nits();
     memcpy(out, n.tm, sizeof n.tm);
 #ifdef GAME_OOT
-    if (!vk_hdr_active()) {
-        out[3] = -1.0f;   // SDR swapchain: vanilla passthrough with the game's bloom and local exposure
-        out[17] = 1.0f;
-        out[20] = out[21] = 1.0f;
+    if (vk_hdr_sdr_scene()) {
+        out[0] = out[1] = out[2] = 203.0f;
+        out[3] = 8.0f;   // BT.709 target with peak equal to diffuse white
+        out[14] = 0.0f;
+        if (!strcmp(cfg_value("REKARINA_HDR_MIDGRAY"), "adaptation")) out[17] = 2.0f;
+        out[21] = 0.0f;
+    } else if (!vk_hdr_active()) {
+        out[3] = -1.0f;
+        out[21] = 1.0f;
     }
 #endif
 }
@@ -225,10 +230,18 @@ enum {
     SPV_OP_COMPOSITE_CONSTRUCT = 80,
     SPV_OP_COMPOSITE_EXTRACT = 81,
     SPV_OP_COMPOSITE_INSERT = 82,
+    SPV_OP_IMAGE_SAMPLE_IMPLICIT_LOD = 87,
+    SPV_OP_IMAGE_SAMPLE_EXPLICIT_LOD = 88,
+    SPV_OP_IMAGE_FETCH = 95,
+    SPV_OP_IMAGE_WRITE = 99,
+    SPV_OP_IMAGE = 100,
+    SPV_OP_BITCAST = 124,
     SPV_OP_FNEGATE = 127,
     SPV_OP_FADD = 129,
     SPV_OP_FMUL = 133,
     SPV_OP_FDIV = 136,
+    SPV_OP_DOT = 148,
+    SPV_OP_ISNAN = 156,
     SPV_OP_SELECT = 169,
     SPV_OP_FORD_EQUAL = 180,
     SPV_OP_ATOMIC_EXCHANGE = 229,
@@ -267,7 +280,8 @@ static int name_is(const uint32_t *a, uint32_t len, const char *s) {   // OpName
 
 static int is_clamp(uint32_t inst) { return inst == GLSL_FCLAMP || inst == GLSL_NCLAMP; }
 
-// The game's FSR 1 pass after the tonemap ends with clamp(colour, 0.0, 1.0) per output channel, clipping HDR
+#if !defined(GAME_OOT) || defined(VK_HDR_SPLICE_TEST_ONLY)
+// TotK's FSR 1 pass after the tonemap ends with clamp(colour, 0.0, 1.0) per output channel, clipping HDR
 // highlights back to 1.0. Replace output-stored clamps (FClamp or NClamp) with FMax/NMax(x, 0.0).
 static int fsr_unclamp(uint32_t *w, uint64_t *words) {
     uint64_t n = *words;
@@ -318,6 +332,7 @@ static int fsr_unclamp(uint32_t *w, uint64_t *words) {
     *words = k;
     return changed ? changed : -1;
 }
+#endif
 
 #ifdef GAME_OOT
 
@@ -365,7 +380,7 @@ static uint32_t spv_res_word(uint32_t op, uint32_t len) {
     if (spv_is_const(op) || op == SPV_OP_FUNCTION || op == SPV_OP_FUNCTION_PARAMETER || op == SPV_OP_FUNCTION_CALL ||
         op == SPV_OP_VARIABLE || op == SPV_OP_LOAD || op == SPV_OP_ACCESS_CHAIN || op == SPV_OP_EXT_INST ||
         op == SPV_OP_VECTOR_SHUFFLE || op == SPV_OP_COMPOSITE_CONSTRUCT || op == SPV_OP_COMPOSITE_EXTRACT ||
-        op == SPV_OP_COMPOSITE_INSERT || op == SPV_OP_PHI || (op >= 109 && op <= 207))
+        op == SPV_OP_COMPOSITE_INSERT || op == SPV_OP_IMAGE_SAMPLE_IMPLICIT_LOD || op == SPV_OP_PHI || (op >= 109 && op <= 207))
         return len >= 3 ? 2 : 0;
     if (op == SPV_OP_ATOMIC_EXCHANGE) return len >= 3 ? 2 : 0;
     return 0;
@@ -564,6 +579,7 @@ typedef struct {
     uint32_t exposed[3];   // scene * gain, before local exposure
     uint32_t add[3];       // a colour added after local exposure (0: none)
     uint32_t scene[3];     // the scene before the gain, where the game has added its bloom (0: not traced)
+    int has_local_term;    // distinguishes a direct gain from an unrecognized local correction
     uint32_t local;        // Exp2 result giving the game's local exposure factor (0: none or not traced)
     uint64_t local_at[3];  // the instruction applying it in each channel (its word offset in main())
     uint32_t local_word[3]; // and the word index of the factor there
@@ -603,6 +619,7 @@ static int extract_exposure(const HostSpv *h, const uint32_t x[3], Exposure *e) 
         }
         for (int c = 0; c < 3; c++) inner[c] = unwrap_func_var(h, rest[c]);
         if (common_mul_factor(h, inner, rest, &f) && is_uniform_load(h, f)) {
+            e->has_local_term = 1;
             note_local(h, val, 3, e->gain, e);
             memcpy(e->exposed, inner, sizeof inner);
             memcpy(e->scene, rest, sizeof rest);
@@ -617,6 +634,7 @@ static int extract_exposure(const HostSpv *h, const uint32_t x[3], Exposure *e) 
     }
     for (int c = 0; c < 3; c++) inner[c] = unwrap_func_var(h, a[c]);
     if (common_mul_factor(h, inner, rest, &f) && is_uniform_load(h, f)) {
+        e->has_local_term = 1;
         note_local(h, val, 5, e->gain, e);
         memcpy(e->exposed, inner, sizeof inner);
         memcpy(e->add, t, sizeof t);
@@ -633,6 +651,56 @@ static const uint32_t *glsl_def(const HostSpv *h, uint32_t id, uint32_t inst) {
     if (id >= h->bound || !h->def[id]) return NULL;
     const uint32_t *ins = h->w + h->def[id];
     return (ins[0] & 0xffff) == SPV_OP_EXT_INST && (ins[0] >> 16) >= 6 && ins[3] == h->glsl && ins[4] == inst ? ins : NULL;
+}
+
+static const uint32_t *host_def(const HostSpv *h, uint32_t id, uint32_t op, uint32_t len) {
+    id = unwrap_func_var(h, id);
+    if (id >= h->bound || !h->def[id]) return NULL;
+    const uint32_t *ins = h->w + h->def[id];
+    return ins[0] == ((len << 16) | op) ? ins : NULL;
+}
+
+static uint32_t output_before_nan_sanitize(const HostSpv *h, uint32_t value) {
+    const uint32_t *cast = host_def(h, value, SPV_OP_BITCAST, 4);
+    const uint32_t *sel = cast ? host_def(h, cast[3], SPV_OP_SELECT, 6) : NULL;
+    const uint32_t *nan = sel ? host_def(h, sel[3], SPV_OP_ISNAN, 4) : NULL;
+    return nan ? nan[3] : value;
+}
+
+// The HDR compose expands the fitted RGB around a shared luminance, then limits each output at a uniform ceiling.
+static uint32_t native_hdr_fit(const HostSpv *h, uint32_t value) {
+    value = output_before_nan_sanitize(h, value);
+    const uint32_t *mn = glsl_def(h, value, GLSL_FMIN);
+    if (!mn) mn = glsl_def(h, value, GLSL_NMIN);
+    if (!mn || (mn[0] >> 16) != 7) return 0;
+    for (unsigned i = 5; i < 7; i++) {
+        if (!is_uniform_load(h, mn[11 - i])) continue;
+        const uint32_t *mx = glsl_def(h, mn[i], GLSL_FMAX);
+        if (!mx) mx = glsl_def(h, mn[i], GLSL_NMAX);
+        if (!mx || (mx[0] >> 16) != 7) continue;
+        for (unsigned j = 5; j < 7; j++) {
+            if (!is_fnear(h, mx[11 - j], 0.0f, 0.0f)) continue;
+            const uint32_t *mul = host_def(h, mx[j], SPV_OP_FMUL, 5);
+            if (!mul) continue;
+            for (unsigned k = 3; k < 5; k++) {
+                const uint32_t *outer = glsl_def(h, mul[k], GLSL_FMA);
+                if (!outer || (outer[0] >> 16) != 8 || !is_fnear(h, outer[7], 1.0f, 0.0f)) continue;
+                for (unsigned m = 5; m < 7; m++) {
+                    const uint32_t *inner = glsl_def(h, outer[m], GLSL_FMA);
+                    if (!inner || (inner[0] >> 16) != 8 || !is_fnear(h, inner[7], -1.0f, 0.0f)) continue;
+                    uint32_t x;
+                    for (unsigned n = 5; n < 7; n++)
+                        if (match_aces_clamp(h, inner[n], &x)) return unwrap_func_var(h, inner[n]);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+static uint32_t compose_fit(const HostSpv *h, uint32_t value) {
+    uint32_t fit = native_hdr_fit(h, value);
+    return fit ? fit : unwrap_func_var(h, output_before_nan_sanitize(h, value));
 }
 
 // exp2(log2(|b|) * power) with a uniform power: how the composite decodes one channel of its bloom texture (the
@@ -697,7 +765,31 @@ static int bloom_operand(const HostSpv *h, uint32_t scene, uint64_t *at, uint32_
             *at = h->def[scene], *word = k;
             return 1;
         }
+
     return 0;
+}
+
+// The pause scene adds the RGB channels of one unencoded bloom sample directly to the graded scene.
+static int direct_bloom_operands(const HostSpv *h, const Exposure *ex, uint64_t at[3], uint32_t word[3]) {
+    uint32_t texture_sample = 0;
+    for (unsigned c = 0; c < 3; c++) {
+        const uint32_t *add = host_def(h, ex->scene[c], SPV_OP_FADD, 5);
+        if (!add || h->def_blk[add[2]] < 0) return 0;
+        unsigned k = is_scene_clamp(h, add[3]) ? 4 : is_scene_clamp(h, add[4]) ? 3 : 0;
+        if (!k) return 0;
+        const uint32_t *extract = host_def(h, add[k], SPV_OP_COMPOSITE_EXTRACT, 5);
+        if (!extract || extract[4] != c) return 0;
+        uint32_t sample = unwrap_func_var(h, extract[3]);
+        const uint32_t *rgb = host_def(h, sample, SPV_OP_VECTOR_SHUFFLE, 8);
+        if (rgb && rgb[3] == rgb[4] && rgb[5] == 0 && rgb[6] == 1 && rgb[7] == 2) sample = rgb[3];
+        if (c == 0) {
+            if (sample >= h->bound || !h->def[sample] ||
+                (h->w[h->def[sample]] & 0xffff) != SPV_OP_IMAGE_SAMPLE_IMPLICIT_LOD) return 0;
+            texture_sample = sample;
+        } else if (sample != texture_sample) return 0;
+        at[c] = (uint64_t)(add - h->w), word[c] = k;
+    }
+    return 1;
 }
 
 // Compute immediate dominators for main()'s CFG using Cooper-Harvey-Kennedy iterative algorithm.
@@ -828,8 +920,12 @@ typedef struct {
 // Splice nx_tonemap from hdr_tonemap_spv into a translated OoT ACES tonemap fragment shader.
 // Returns 1 if spliced, 0 if the shader is not an ACES tonemap shader, -1 on splice failure; *trace (may be NULL) says
 // what else was found.
-static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, SpliceTrace *trace) {
+enum { SPLICE_ACES, SPLICE_HDR_SCENE, SPLICE_HDR_EFFECTS, SPLICE_VANILLA_GRADE };
+
+static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, int mode, SpliceTrace *trace) {
     enum { DEC_BUILTIN = 11, BUILTIN_FRAG_COORD = 15, SC_STORAGE_BUFFER = 12 };
+    const int native_compose = mode != SPLICE_ACES, effects_only = mode == SPLICE_HDR_EFFECTS;
+    const int grade_only = mode == SPLICE_VANILLA_GRADE;
     if (trace) memset(trace, 0, sizeof *trace);
     const uint32_t *w = *spirv;
     uint64_t n = *words;
@@ -988,7 +1084,7 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
             if ((cc[0] & 0xffff) == SPV_OP_COMPOSITE_CONSTRUCT && (cc[0] >> 16) == 7) {
                 int sidx[3] = {-1, -1, -1};
                 for (int c = 0; c < 3; c++) {
-                    uint32_t u = unwrap_func_var(&h, cc[3 + c]);
+                    uint32_t u = native_compose ? compose_fit(&h, cc[3 + c]) : unwrap_func_var(&h, cc[3 + c]);
                     for (int s = 0; s < nsite; s++)
                         if (site_id[s] == u) { sidx[c] = s; break; }
                 }
@@ -1014,10 +1110,10 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
                 int32_t ch = h.ival[ac[4]];
                 if (ch < 0 || ch >= 3) continue;
                 int matched = -1;
-                uint32_t uval = unwrap_func_var(&h, val);
+                uint32_t uval = native_compose ? compose_fit(&h, val) : unwrap_func_var(&h, val);
                 for (int s = 0; s < nsite; s++)
                     if (site_id[s] == uval) { matched = s; break; }
-                if (matched < 0) {
+                if (matched < 0 && !native_compose) {
                     // Translator FP16/NaN sanitizer loads site_var between AccessChain and OpStore.
                     for (uint64_t j = h.def[dst]; j < i; j += w[j] >> 16) {
                         if ((w[j] & 0xffff) == SPV_OP_LOAD && (w[j] >> 16) >= 4) {
@@ -1064,6 +1160,21 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
     }
     if (!store_mode) goto fail_0;
 
+    uint64_t grade_pos = 0;
+    uint32_t grade_in[3] = {0};
+    if (grade_only) {
+        grade_pos = site_pos[chan_site[0]];
+        for (int c = 1; c < 3; c++)
+            if (site_pos[chan_site[c]] < grade_pos) grade_pos = site_pos[chan_site[c]];
+        const int32_t block = h.def_blk[w[grade_pos + 2]];
+        for (int c = 0; c < 3; c++) {
+            // The guest can reload each channel immediately before its fit, after all three values were computed.
+            grade_in[c] = dominates(&h, x_in[c], block, grade_pos) ? x_in[c] : unwrap_func_var(&h, x_in[c]);
+            if (!dominates(&h, grade_in[c], block, grade_pos) ||
+                h.def_blk[site_id[chan_site[c]]] != block) goto fail_0;
+        }
+    }
+
     // Insertion point:
     // - If all 3 ACES clamp sites & x_in[] dominate the earliest channel AccessChain (standard layout), insert the
     //   nx_tonemap call right before that AccessChain and replace the 3 OpStore values in place (inline_replace = 1).
@@ -1107,16 +1218,31 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
     // sees the same bloom. Used only when all three channels are found, in three different instructions.
     uint64_t bloom_at[3] = {0};
     uint32_t bloom_word[3] = {0};
+    unsigned expanded = 0;
+    if (native_compose) {
+        for (unsigned c = 0; c < 3; c++) {
+            uint32_t value = w[store_pos[c] + 2];
+            if (store_mode == 2) value = w[h.def[value] + 3 + c];
+            expanded += native_hdr_fit(&h, value) != 0;
+        }
+        if (expanded && expanded != 3) goto fail_0;
+    }
     int has_bloom = has_exp;
     for (int c = 0; c < 3 && has_bloom; c++)
         has_bloom = ex.scene[c] && bloom_operand(&h, ex.scene[c], &bloom_at[c], &bloom_word[c]);
+    if (!has_bloom && !expanded && has_exp && !ex.has_local_term && direct_bloom_operands(&h, &ex, bloom_at, bloom_word)) {
+        has_bloom = 1;
+        meter_binding = 0;   // the pause view must not meter the gameplay eye adaptation
+    }
     if (has_bloom && (bloom_at[0] == bloom_at[1] || bloom_at[1] == bloom_at[2] || bloom_at[0] == bloom_at[2]))
         has_bloom = 0;
     int has_local = has_exp && ex.local && w[h.def[ex.local] + 1] == f32_ty;
     for (int c = 0; c < 3 && has_local; c++)
         has_local = h.def[ex.local] < ex.local_at[c] &&
                     dominates(&h, ex.local, h.def_blk[w[ex.local_at[c] + 2]], ex.local_at[c]);
-    if (!has_exp || !ex.scene[0] || !ex.scene[1] || !ex.scene[2]) meter_binding = 0;
+    // The HDR compose with direct uniform gain has bloom but no local exposure term.
+    if ((effects_only || mode == SPLICE_HDR_SCENE) && (!has_bloom || (ex.has_local_term && !has_local))) goto fail_0;
+    if (grade_only || !has_exp || !ex.scene[0] || !ex.scene[1] || !ex.scene[2]) meter_binding = 0;
     if (trace) *trace = (SpliceTrace){has_exp, has_bloom, has_local, meter_binding};
 
     // Inspect the tone mapper library (hdr_tonemap_spv) and map/deduplicate its IDs.
@@ -1128,7 +1254,7 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
     uint8_t *lskip = calloc(lbound, 1);   // library type/var IDs belonging only to main()
     if (!lmap || !lskip) { free(lmap); free(lskip); goto fail_err; }
 
-    uint32_t lmain = 0, lnx = 0, lnx_ftype = 0, lmeasure = 0, lmeter = 0, lmeter_struct = 0, lmeter_array = 0;
+    uint32_t lmain = 0, lnx = 0, lnx_ftype = 0, lgrade = 0, lmeasure = 0, lmeter = 0, lmeter_struct = 0, lmeter_array = 0;
     uint64_t lfirst_func = 0;
     for (uint64_t i = 5; i < ln;) {
         uint32_t op = lw[i] & 0xffff, len = lw[i] >> 16;
@@ -1137,6 +1263,7 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
         if (op == SPV_OP_EXT_INST_IMPORT && len >= 3 && name_is(a, len, "GLSL.std.450")) lmap[a[0]] = h.glsl;
         else if (op == SPV_OP_ENTRY_POINT && len >= 4) lmain = a[1];
         else if (op == SPV_OP_NAME && len >= 3 && name_prefix(a, len, "nx_tonemap(")) lnx = a[0];
+        else if (op == SPV_OP_NAME && len >= 3 && name_prefix(a, len, "graded_aces(")) lgrade = a[0];
         else if (op == SPV_OP_NAME && len >= 3 && name_prefix(a, len, "hdr_measure(")) lmeasure = a[0];
         else if (op == SPV_OP_NAME && len >= 3 && name_is(a, len, "hdr_meter")) lmeter = a[0];
         else if (op == SPV_OP_NAME && len >= 3 && name_is(a, len, "HdrAdaptationMeter")) lmeter_struct = a[0];
@@ -1149,7 +1276,7 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
         if (op == SPV_OP_FUNCTION && len >= 5 && a[1] == lnx && lnx) lnx_ftype = a[3];
         i += len;
     }
-    if (!lnx || !lnx_ftype || !lfirst_func) { free(lmap); free(lskip); goto fail_err; }
+    if (!lnx || !lnx_ftype || !lfirst_func || (grade_only && !lgrade)) { free(lmap); free(lskip); goto fail_err; }
     if (!lmeasure || !lmeter || !lmeter_struct || !lmeter_array) { free(lmap); free(lskip); goto fail_err; }
 
     // Read nx_tonemap's parameter types (vec3 return, pointer to vec3, then pointers to vec4).
@@ -1357,11 +1484,11 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
     uint32_t var_x = next_id++, var_sc = next_id++, var_p[NX_TONEMAP_PARAMS];
     uint32_t var_adapt = next_id++, var_frag = meter_binding ? next_id++ : 0;
     for (uint32_t k = 0; k < NX_TONEMAP_PARAMS; k++) var_p[k] = next_id++;
-    uint32_t out_ch[3] = {0}, local_factor = 0;
+    uint32_t out_ch[3] = {0}, local_factor = 0, graded = 0;
     int entry_patched = 0;
     for (uint64_t i = first_func; i < n;) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
-        if (i > main_start && i < main_end && op == SPV_OP_LABEL && !entry_patched) {
+        if (!effects_only && i > main_start && i < main_end && op == SPV_OP_LABEL && !entry_patched) {
             spv_emit(&out, w + i, len);
             SPV_INS(&out, SPV_OP_VARIABLE, m_pfunc_v3, var_x, SPV_SC_FUNCTION);
             SPV_INS(&out, SPV_OP_VARIABLE, m_pfunc_v4, var_sc, SPV_SC_FUNCTION);
@@ -1373,18 +1500,39 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
             i += len;
             continue;
         }
-        if (store_mode == 1 && !inline_replace &&
+        if (grade_only && i == grade_pos) {
+            uint32_t x = next_id++;
+            SPV_INS(&out, SPV_OP_COMPOSITE_CONSTRUCT, m_vec3, x, grade_in[0], grade_in[1], grade_in[2]);
+            SPV_INS(&out, SPV_OP_STORE, var_x, x);
+            for (unsigned k = 1; k <= 2; k++) {
+                uint32_t ptr = next_id++, value = next_id++;
+                SPV_INS(&out, SPV_OP_ACCESS_CHAIN, ptr_u_vec4, ptr, sup_var, c_idx[k]);
+                SPV_INS(&out, SPV_OP_LOAD, vec4_ty, value, ptr);
+                SPV_INS(&out, SPV_OP_STORE, var_p[k], value);
+            }
+            graded = next_id++;
+            SPV_INS(&out, SPV_OP_FUNCTION_CALL, m_vec3, graded, lmap[lgrade], var_x, var_p[1], var_p[2]);
+        }
+        if (grade_only) {
+            int channel = i == site_pos[chan_site[0]] ? 0 : i == site_pos[chan_site[1]] ? 1 : i == site_pos[chan_site[2]] ? 2 : -1;
+            if (channel >= 0) {
+                SPV_INS(&out, SPV_OP_COMPOSITE_EXTRACT, f32_ty, site_id[chan_site[channel]], graded, (uint32_t)channel);
+                i += len;
+                continue;
+            }
+        }
+        if (!effects_only && !grade_only && store_mode == 1 && !inline_replace &&
             (i == store_pos[0] || i == store_pos[1] || i == store_pos[2]) && i != ins_pos) {
             i += len;   // deferred to ins_pos
             continue;
         }
-        if (i == ins_pos) {
+        if (!effects_only && !grade_only && i == ins_pos) {
             uint32_t x_vec = next_id++;
             SPV_INS(&out, SPV_OP_COMPOSITE_CONSTRUCT, m_vec3, x_vec, x_in[0], x_in[1], x_in[2]);
             SPV_INS(&out, SPV_OP_STORE, var_x, x_vec);
 
             uint32_t sc_ch[3];
-            if (has_exp) {
+            if (has_exp && !native_compose) {
                 for (int c = 0; c < 3; c++) {
                     if (ex.add[c]) {
                         sc_ch[c] = next_id++;
@@ -1435,7 +1583,7 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
             i += len;
             continue;
         }
-        if (inline_replace) {
+        if (!effects_only && !grade_only && inline_replace) {
             int ch = i == store_pos[0] ? 0 : i == store_pos[1] ? 1 : i == store_pos[2] ? 2 : -1;
             if (ch >= 0) {
                 SPV_INS(&out, SPV_OP_STORE, ptr_ch[ch], out_ch[ch]);
@@ -1488,7 +1636,7 @@ static int tonemap_splice(uint32_t **spirv, uint64_t *words, int meter_binding, 
     }
 
     // 5. Emit all non-main functions from hdr_tonemap_spv.
-    {
+    if (!effects_only) {
         int in_main = 0;
         for (uint64_t i = lfirst_func; i < ln;) {
             uint32_t op = lw[i] & 0xffff, len = lw[i] >> 16;
@@ -1523,36 +1671,198 @@ fail_0:
     return 0;
 }
 
-int vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words) {
-    if (!vk_hdr_armed() || vk_hdr_native() || !*spirv || *words < 5) return 0;
-    int unclamped = fsr_unclamp(*spirv, words);
-    if (unclamped > 0) {
-        static volatile int32_t fsrs;
-        rt_log("hdr: the game's FSR pass keeps values above 1 (%d output clamps; %d so far)", unclamped,
-               plat_inc32(&fsrs));
-        return 0;
-    }
-    if (unclamped < 0) {
-        static volatile int32_t missed;
-        if (plat_inc32(&missed) == 1)
-            rt_log("hdr: the game's FSR pass was found but no clamp of its output; it still clips HDR highlights");
-        return 0;
-    }
+int vk_hdr_scene_splice(uint32_t **spirv, uint64_t *words, GfxRenodxVariant variant, int *meter_binding) {
     SpliceTrace trace;
-    int spliced = tonemap_splice(spirv, words, vk_hdr_adaptation_supported(), &trace);
-    if (spliced > 0) {
-        static volatile int32_t swaps;
-        rt_log("hdr: spliced RenoDX tonemap into ACES shader (%s, %s, %s, %s; %d so far)",
-               trace.exposure ? "exposure traced" : "fallback exposure",
-               trace.bloom ? "bloom traced" : "no bloom term",
-               trace.local_exposure ? "local exposure traced" : "no local exposure term",
-               trace.meter_binding ? "eye adaptation meter" : "no eye adaptation meter", plat_inc32(&swaps));
-        return trace.meter_binding;
-    } else if (spliced < 0) {
-        static volatile int32_t errs;
-        if (plat_inc32(&errs) <= 4)
-            rt_log("hdr: ACES tonemap shader could not be spliced; leaving game shader unchanged");
+    int mode = variant == GFX_RENODX_HDR ? SPLICE_HDR_SCENE : variant == GFX_RENODX_EFFECTS ? SPLICE_HDR_EFFECTS
+               : variant == GFX_RENODX_SDR ? SPLICE_ACES : SPLICE_VANILLA_GRADE;
+    int result = tonemap_splice(spirv, words, (variant == GFX_RENODX_HDR || variant == GFX_RENODX_SDR) &&
+                                vk_hdr_adaptation_supported(), mode, &trace);
+    *meter_binding = result > 0 ? trace.meter_binding : 0;
+    return result;
+}
+
+// The packed AA path encodes in BT.2020. Only scene-color reads and final linear stores cross the gamut boundary.
+static void aa_color_convert(SpvBuf *out, uint32_t *next, uint32_t v4, uint32_t v3, uint32_t f32,
+                             uint32_t glsl, uint32_t zero3, const uint32_t rows[3], uint32_t dst, uint32_t src) {
+    uint32_t rgb = (*next)++, alpha = (*next)++, converted = (*next)++, c[3];
+    SPV_INS(out, SPV_OP_VECTOR_SHUFFLE, v3, rgb, src, src, 0, 1, 2);
+    SPV_INS(out, SPV_OP_COMPOSITE_EXTRACT, f32, alpha, src, 3);
+    for (unsigned i = 0; i < 3; ++i) {
+        c[i] = (*next)++;
+        SPV_INS(out, SPV_OP_DOT, f32, c[i], rgb, rows[i]);
     }
+    SPV_INS(out, SPV_OP_COMPOSITE_CONSTRUCT, v3, converted, c[0], c[1], c[2]);
+    if (zero3) {
+        uint32_t nonnegative = (*next)++;
+        SPV_INS(out, SPV_OP_EXT_INST, v3, nonnegative, glsl, GLSL_FMAX, converted, zero3);
+        converted = nonnegative;
+    }
+    SPV_INS(out, SPV_OP_COMPOSITE_CONSTRUCT, v4, dst, converted, alpha);
+}
+
+// Only retype the edge-mask descriptor. Its fetches and gathers carry integer bits through float temporaries.
+int vk_aa_mask_splice(uint32_t **spirv, uint64_t *words, unsigned binding) {
+    enum { TYPE_IMAGE = 25, TYPE_SAMPLED_IMAGE = 27, IMAGE_GATHER = 96, IMAGE_QUERY_SIZE_LOD = 103 };
+    const uint32_t *w = *spirv;
+    if (*words < 5 || w[0] != 0x07230203 || !w[3] || w[3] > *words || w[3] > UINT32_MAX - 1024) return 0;
+    uint32_t bound = w[3], next = bound, target = 0, u32 = 0, u4 = 0, f32 = 0, f4 = 0;
+    uint32_t image = 0, sampled = 0, pointer = 0, sites = 0;
+    const uint32_t **def = calloc(bound, sizeof *def);
+    uint8_t *kind = calloc(bound, sizeof *kind);
+    SpvBuf out = {0};
+    if (!def || !kind) goto reject;
+    spv_emit(&out, w, 5);
+    for (uint64_t i = 5; i < *words;) {
+        const uint32_t *a = w + i;
+        uint32_t n = a[0] >> 16, op = a[0] & 0xffff;
+        if (!n || i + n > *words) goto reject;
+        if (op == SPV_OP_DECORATE && n == 4 && a[2] == SPV_DEC_BINDING && a[3] == binding) {
+            if (target || !a[1] || a[1] >= bound) goto reject;
+            target = a[1];
+        }
+        if (op == SPV_OP_TYPE_INT && n == 4 && a[2] == 32 && a[3] == 0) u32 = a[1];
+        if (op == SPV_OP_TYPE_FLOAT && n == 3 && a[2] == 32) f32 = a[1];
+        if (op == SPV_OP_TYPE_VECTOR && n == 4 && a[3] == 4) {
+            if (a[2] == u32) u4 = a[1];
+            if (a[2] == f32) f4 = a[1];
+        }
+        if ((op == TYPE_IMAGE || op == TYPE_SAMPLED_IMAGE || op == SPV_OP_TYPE_POINTER) && n >= 3 && a[1] < bound)
+            def[a[1]] = a;
+        if (op == SPV_OP_VARIABLE && n == 4 && target && a[2] == target) {
+            const uint32_t *ptr = a[1] < bound ? def[a[1]] : NULL;
+            if (!u32 || !f4 || a[3] != 0 || !ptr || ptr[0] != (4u << 16 | SPV_OP_TYPE_POINTER) || ptr[2] != 0) goto reject;
+            const uint32_t *s = ptr[3] < bound ? def[ptr[3]] : NULL;
+            if (!s || s[0] != (3u << 16 | TYPE_SAMPLED_IMAGE)) goto reject;
+            const uint32_t *im = s[2] < bound ? def[s[2]] : NULL;
+            if (!im || im[0] != (9u << 16 | TYPE_IMAGE) || im[2] != f32 || im[3] != 1 || im[4] || im[5] || im[6] ||
+                im[7] != 1 || im[8]) goto reject;
+            if (!u4) {
+                u4 = next++;
+                SPV_INS(&out, SPV_OP_TYPE_VECTOR, u4, u32, 4);
+            }
+            image = next++, sampled = next++, pointer = next++;
+            SPV_INS(&out, TYPE_IMAGE, image, u32, 1, 0, 0, 0, 1, 0);
+            SPV_INS(&out, TYPE_SAMPLED_IMAGE, sampled, image);
+            SPV_INS(&out, SPV_OP_TYPE_POINTER, pointer, 0, sampled);
+            SPV_INS(&out, SPV_OP_VARIABLE, pointer, target, 0);
+        } else if (op == SPV_OP_LOAD && n == 4 && pointer && a[3] == target && a[2] < bound) {
+            kind[a[2]] = 1;
+            SPV_INS(&out, SPV_OP_LOAD, sampled, a[2], target);
+        } else if (op == SPV_OP_IMAGE && n == 4 && a[2] < bound && a[3] < bound && kind[a[3]] == 1) {
+            kind[a[2]] = 2;
+            SPV_INS(&out, SPV_OP_IMAGE, image, a[2], a[3]);
+        } else if (op >= SPV_OP_IMAGE_SAMPLE_IMPLICIT_LOD && op <= 107 && n >= 4 && a[3] < bound && kind[a[3]]) {
+            if (op == IMAGE_QUERY_SIZE_LOD && kind[a[3]] == 2) spv_emit(&out, a, n);
+            else {
+                if (n < 5 || a[1] != f4 || next == UINT32_MAX ||
+                    !((op == SPV_OP_IMAGE_FETCH && kind[a[3]] == 2) || (op == IMAGE_GATHER && kind[a[3]] == 1))) goto reject;
+                uint32_t raw = next++;
+                spv_emit(&out, a, 1);
+                spv_emit(&out, (uint32_t[]){u4, raw}, 2);
+                spv_emit(&out, a + 3, n - 3);
+                SPV_INS(&out, SPV_OP_BITCAST, f4, a[2], raw);
+                ++sites;
+            }
+        } else spv_emit(&out, a, n);
+        i += n;
+    }
+    if (out.err || sites != 91) goto reject;
+    out.w[3] = next;
+    free(def);
+    free(kind);
+    free(*spirv);
+    *spirv = out.w, *words = out.n;
+    return 1;
+reject:
+    free(def);
+    free(kind);
+    free(out.w);
+    return 0;
+}
+
+int vk_hdr_aa_splice(uint32_t **spirv, uint64_t *words, unsigned binding, unsigned expected, int store) {
+    const uint32_t *w = *spirv;
+    if (*words < 5 || w[0] != 0x07230203 || !expected || w[3] > *words || w[3] > UINT32_MAX - 1024) return 0;
+    const uint32_t bound = w[3];
+    uint32_t *root = calloc(bound, sizeof *root);
+    if (!root) return 0;
+    uint32_t f32 = 0, v3 = 0, v4 = 0, glsl = 0, image = 0, sites = 0, next = bound, rows[3] = {0}, zero3 = 0;
+    int declared = 0;
+    SpvBuf out = {0};
+    spv_emit(&out, w, 5);
+    for (uint64_t i = 5; i < *words;) {
+        const uint32_t *a = w + i;
+        uint32_t n = a[0] >> 16, op = a[0] & 0xffff;
+        if (!n || i + n > *words) goto rejected;
+        if (op == SPV_OP_EXT_INST_IMPORT && name_is(a + 1, n, "GLSL.std.450")) glsl = a[1];
+        if (op == SPV_OP_DECORATE && n == 4 && a[2] == SPV_DEC_BINDING && a[3] == binding) {
+            if (image || !a[1] || a[1] >= bound) goto rejected;
+            image = a[1];
+            root[image] = image;
+        }
+        if (op == SPV_OP_TYPE_FLOAT && n == 3 && a[2] == 32) f32 = a[1];
+        if (op == SPV_OP_TYPE_VECTOR && n == 4 && f32 && a[2] == f32) {
+            if (a[3] == 3) v3 = a[1];
+            if (a[3] == 4) v4 = a[1];
+        }
+        if (op == SPV_OP_FUNCTION && !declared) {
+            if (!f32 || !v4 || !image || (!store && !glsl)) goto rejected;
+            if (!v3) {
+                v3 = next++;
+                SPV_INS(&out, SPV_OP_TYPE_VECTOR, v3, f32, 3);
+            }
+            static const float matrix[2][3][3] = {
+                {{0.627403896f, 0.329283038f, 0.043313066f}, {0.069097289f, 0.919540396f, 0.011362315f},
+                 {0.016391439f, 0.088013308f, 0.895595253f}},
+                {{1.660491002f, -0.587641139f, -0.072849863f}, {-0.124550475f, 1.132899897f, -0.008349422f},
+                 {-0.018150763f, -0.100578898f, 1.118729661f}},
+            };
+            for (unsigned channel = 0; channel < 3; ++channel) {
+                uint32_t c[3];
+                for (unsigned k = 0; k < 3; ++k) {
+                    uint32_t bits;
+                    memcpy(&bits, &matrix[!!store][channel][k], sizeof bits);
+                    c[k] = next++;
+                    SPV_INS(&out, SPV_OP_CONSTANT, f32, c[k], bits);
+                }
+                rows[channel] = next++;
+                SPV_INS(&out, SPV_OP_CONSTANT_COMPOSITE, v3, rows[channel], c[0], c[1], c[2]);
+            }
+            if (!store) {
+                zero3 = next++;
+                SPV_INS(&out, SPV_OP_CONSTANT_NULL, v3, zero3);
+            }
+            declared = 1;
+        }
+        if ((op == SPV_OP_LOAD || op == SPV_OP_IMAGE) && n >= 4 && a[2] < bound && a[3] < bound)
+            root[a[2]] = root[a[3]];
+        if (!store && (op == SPV_OP_IMAGE_SAMPLE_EXPLICIT_LOD || op == SPV_OP_IMAGE_FETCH) &&
+            n >= 5 && a[3] < bound && root[a[3]] == image && image) {
+            if (!declared || a[1] != v4 || ++sites > expected) goto rejected;
+            uint32_t raw = next++;
+            spv_emit(&out, a, 2);
+            spv_emit(&out, &raw, 1);
+            spv_emit(&out, a + 3, n - 3);
+            aa_color_convert(&out, &next, v4, v3, f32, glsl, zero3, rows, a[2], raw);
+        } else if (store && op == SPV_OP_IMAGE_WRITE && n >= 4 && a[1] < bound && root[a[1]] == image && image) {
+            if (!declared || ++sites > expected) goto rejected;
+            uint32_t color = next++;
+            aa_color_convert(&out, &next, v4, v3, f32, glsl, 0, rows, color, a[3]);
+            spv_emit(&out, a, 3);
+            spv_emit(&out, &color, 1);
+            spv_emit(&out, a + 4, n - 4);
+        } else spv_emit(&out, a, n);
+        i += n;
+    }
+    if (out.err || sites != expected) goto rejected;
+    out.w[3] = next;
+    free(root);
+    free(*spirv);
+    *spirv = out.w, *words = out.n;
+    return 1;
+rejected:
+    free(root);
+    free(out.w);
     return 0;
 }
 
@@ -1663,7 +1973,6 @@ int vk_hdr_active(void) { return __atomic_load_n(&g_active, __ATOMIC_ACQUIRE); }
 
 #ifdef GAME_OOT
 // Both the checked output draw and present sealing run in replay order.
-// ADR-0001: keep SDR and Host HDR at zero per-draw cost by only arming Output Proof when Guest PQ or RT_TRACE_GFX is active.
 static struct {
     uint64_t frame;
     VkImage image;
@@ -1673,49 +1982,27 @@ static struct {
     VkGuestPq pq;
 } written_outputs[8];
 static unsigned next_written_output;
-uint64_t vk_hdr_output_pending_frame;
-static int32_t g_guest_pq_active;
-
-int vk_hdr_output_track_enabled(void) {
-    return vk_hdr_native() || __atomic_load_n(&g_guest_pq_active, __ATOMIC_ACQUIRE) || (rt_trace & RT_TRACE_GFX);
-}
-
-void vk_hdr_output_set_guest_pq(int on) {
-    __atomic_store_n(&g_guest_pq_active, on ? 1 : 0, __ATOMIC_RELEASE);
-}
+static uint64_t written_output_frame;
 
 int vk_hdr_output_pending(void) {
-    if (!vk_hdr_output_pending_frame) return 0;
-    if (vk_hdr_output_pending_frame == __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1) return 1;
-    vk_hdr_output_pending_frame = 0;
-    return 0;
-}
-
-int vk_hdr_output_targets_pending(VkImage image, uint64_t address) {
-    if (!vk_hdr_output_pending()) return 0;
-    for (unsigned i = 0; i < 8; i++) {
-        if (written_outputs[i].frame != vk_hdr_output_pending_frame) continue;
-        if ((image && written_outputs[i].image == image) || (address && written_outputs[i].address == address))
-            return 1;
-    }
-    return 0;
+    return written_output_frame && written_output_frame == __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
 }
 
 void vk_hdr_output_overwrite(VkImage image, uint64_t address) {
     if (!vk_hdr_output_pending()) return;
     int remaining = 0;
     for (unsigned i = 0; i < 8; i++) {
-        if (written_outputs[i].frame != vk_hdr_output_pending_frame) continue;
+        if (written_outputs[i].frame != written_output_frame) continue;
         if ((image && written_outputs[i].image == image) || (address && written_outputs[i].address == address))
             written_outputs[i].frame = 0;
         else remaining = 1;
     }
-    if (!remaining) vk_hdr_output_pending_frame = 0;
+    if (!remaining) written_output_frame = 0;
 }
 
 void vk_hdr_record_output(uint32_t serial, VkImage image, uint64_t address, GfxOutputEncoding encoding, const VkGuestPq *pq) {
     uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
-    vk_hdr_output_pending_frame = frame;
+    written_output_frame = frame;
     unsigned index = 8;
     for (unsigned i = 0; i < 8; i++) {
         if (written_outputs[i].frame != frame || written_outputs[i].serial != serial) continue;
@@ -1877,10 +2164,16 @@ static void img_free(VkCtx *c, Img *m) {
 static int img_ensure(VkCtx *c, Img *m, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage) {
     if (m->img && m->w == w && m->h == h && m->format == fmt) return 1;
     if (m->img) {
-        vk_queue_lock();
-        vkDeviceWaitIdle(c->device);
-        vk_queue_unlock();
-        img_free(c, m);
+        if (vk_exec_recording_fence()) {
+            vk_defer_view(m->view);
+            vk_defer_image(m->img, m->alloc);
+            *m = (Img){0};
+        } else {
+            vk_queue_lock();
+            vkDeviceWaitIdle(c->device);
+            vk_queue_unlock();
+            img_free(c, m);
+        }
     }
     VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
                             .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -1902,6 +2195,12 @@ static int img_ensure(VkCtx *c, Img *m, uint32_t w, uint32_t h, VkFormat fmt, Vk
     return 1;
 }
 
+typedef struct UiPipeline {
+    struct UiPipeline *next;
+    VkPipeline pipeline;
+    VkFormat format;
+} UiPipeline;
+
 static struct {
     int tried, ok;
     PFN_vkCmdPushDescriptorSetKHR push;
@@ -1909,10 +2208,12 @@ static struct {
     VkDescriptorSetLayout dsl_enc, dsl_ui;
     VkPipelineLayout enc_layout, ui_layout;
     VkPipeline enc;
-    VkPipeline ui;
-    VkFormat ui_fmt;
+    UiPipeline *ui;
     Img out;
     Img menu;
+#ifdef GAME_OOT
+    Img preview;
+#endif
     VkImageView src_view[SLOTS];
 } H;
 
@@ -1975,7 +2276,6 @@ static int init(VkCtx *c) {
 }
 
 VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4], const VkGuestPq *pq) {
-    if (!pq && vk_hdr_native_picture(fmt)) return VK_NULL_HANDLE;   // game already encoded PQ Rec. 2020
     VkCtx *c = vk_ctx();
     if (!H.tried) init(c);
     if (!H.ok || !img_ensure(c, &H.out, (uint32_t)crop[2], (uint32_t)crop[3], VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -2010,7 +2310,7 @@ VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat f
     rec_push(H.push, cb, VK_PIPELINE_BIND_POINT_COMPUTE, H.enc_layout, 0, 2, w);
     struct { int32_t offset[2], size[2]; float p[4], adj[4], q[4], rows[3][4]; } pc = {
         {crop[0], crop[1]}, {crop[2], crop[3]}, {n.ui, n.peak, decode ? 1.0f : 0.0f, n.gamma},
-        {adj[0], adj[1], adj[2], adj[3]}, {grade ? 1.0f : 0.0f, n.game / n.ui, n.p3, pq ? 1.0f : 0.0f}, {{0}}};
+        {adj[0], adj[1], adj[2], adj[3]}, {grade ? 1.0f : 0.0f, n.game / n.ui, 0, pq ? 1.0f : 0.0f}, {{0}}};
     if (pq) memcpy(pc.rows, pq->row, sizeof pc.rows);
     vkCmdPushConstants(cb, H.enc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     vkCmdDispatch(cb, ((uint32_t)crop[2] + 7) / 8, ((uint32_t)crop[3] + 7) / 8, 1);
@@ -2032,15 +2332,9 @@ VkImageView vk_hdr_ui_target(VkCommandBuffer cb, uint32_t w, uint32_t h) {
     return H.menu.view;
 }
 
-static int ui_pipeline(VkCtx *c, VkFormat fmt) {
-    if (H.ui && H.ui_fmt == fmt) return 1;
-    if (H.ui) {
-        vk_queue_lock();
-        vkDeviceWaitIdle(c->device);
-        vk_queue_unlock();
-        vkDestroyPipeline(c->device, H.ui, NULL);
-        H.ui = VK_NULL_HANDLE;
-    }
+static VkPipeline ui_pipeline(VkCtx *c, VkFormat fmt) {
+    for (UiPipeline *p = H.ui; p; p = p->next)
+        if (p->format == fmt) return p->pipeline;
     VkShaderModule vs = module(c, hdr_fullscreen_spv, sizeof hdr_fullscreen_spv),
                    fs = module(c, hdr_ui_spv, sizeof hdr_ui_spv);
     VkPipelineShaderStageCreateInfo st[2] = {
@@ -2058,11 +2352,13 @@ static int ui_pipeline(VkCtx *c, VkFormat fmt) {
                                                  .lineWidth = 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    const VkColorComponentFlags rgb = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    const int guest_float = fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || fmt == VK_FORMAT_R16G16B16A16_SFLOAT;
     VkPipelineColorBlendAttachmentState ba = {
         .blendEnable = VK_TRUE, .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
         .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, .colorBlendOp = VK_BLEND_OP_ADD,
         .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-        .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = 0xf};
+        .alphaBlendOp = VK_BLEND_OP_ADD, .colorWriteMask = guest_float ? rgb : rgb | VK_COLOR_COMPONENT_A_BIT};
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                               .attachmentCount = 1, .pAttachments = &ba};
     VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -2075,22 +2371,27 @@ static int ui_pipeline(VkCtx *c, VkFormat fmt) {
                                        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
                                        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds,
                                        .layout = H.ui_layout};
-    VkResult r = vs && fs ? vkCreateGraphicsPipelines(c->device, VK_NULL_HANDLE, 1, &gi, NULL, &H.ui) : VK_ERROR_UNKNOWN;
+    VkPipeline pipeline;
+    VkResult r = vs && fs ? vkCreateGraphicsPipelines(c->device, VK_NULL_HANDLE, 1, &gi, NULL, &pipeline) : VK_ERROR_UNKNOWN;
     if (vs) vkDestroyShaderModule(c->device, vs, NULL);
     if (fs) vkDestroyShaderModule(c->device, fs, NULL);
     if (r != VK_SUCCESS) {
-        H.ui = VK_NULL_HANDLE;
         rt_log("hdr: the menu pass could not be created; the menu is not shown");
-        return 0;
+        return VK_NULL_HANDLE;
     }
-    H.ui_fmt = fmt;
-    return 1;
+    UiPipeline *p = malloc(sizeof *p);
+    if (!p) rt_fatal("hdr: out of memory caching a menu pipeline");
+    *p = (UiPipeline){H.ui, pipeline, fmt};
+    H.ui = p;
+    return pipeline;
 }
 
 static int ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, uint32_t w, uint32_t h,
                       const float pc[4]) {
     VkCtx *c = vk_ctx();
-    if (!H.ok || !H.menu.img || !ui_pipeline(c, fmt)) return 0;
+    if (!H.ok || !H.menu.img) return 0;
+    VkPipeline pipeline = ui_pipeline(c, fmt);
+    if (!pipeline) return 0;
     barrier(cb, H.menu.img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
@@ -2100,7 +2401,7 @@ static int ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, ui
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1,
                           .colorAttachmentCount = 1, .pColorAttachments = &ca};
     vkCmdBeginRendering(cb, &ri);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, H.ui);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     VkViewport v = {0, 0, (float)w, (float)h, 0, 1};
     VkRect2D s = {{0, 0}, {w, h}};
     vkCmdSetViewport(cb, 0, 1, &v);
@@ -2117,13 +2418,83 @@ static int ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, ui
 
 void vk_hdr_ui_compose(VkCommandBuffer cb, VkImageView dst_view, VkFormat fmt, uint32_t w, uint32_t h) {
     Nits n = nits();
-    ui_compose(cb, dst_view, fmt, w, h, (float[4]){n.ui, n.gamma, 0, 0});
+#ifdef GAME_OOT
+    float eotf = vk_hdr_native() ? n.gamma : n.ui_eotf;
+#else
+    float eotf = n.gamma;
+#endif
+    ui_compose(cb, dst_view, fmt, w, h, (float[4]){n.ui, eotf, 0, 0});
 }
+
+#ifdef GAME_OOT
+int vk_hdr_ui_guest_compose(VkCommandBuffer cb, const VkTexImage *source, VkImageView target,
+                            int preview[4], const VkGuestPq *pq) {
+    float white_scale = 1.0f;
+    float eotf = 0.0f;
+    if (pq) {
+        if (!pq->valid) return 0;
+        float white = pq->row[0][0] + pq->row[0][1] + pq->row[0][2];
+        if (!isfinite(white) || white <= 0.0f) return 0;
+        Nits n = nits();
+        white_scale = n.ui / white;
+        if (!vk_hdr_native()) eotf = n.ui_eotf;
+    }
+    VkCtx *c = vk_ctx();
+    const uint32_t w = source->width, h = source->height;
+    const VkFormat format = source->format;
+    VkFormatProperties properties;
+    vkGetPhysicalDeviceFormatProperties(c->phys, format, &properties);
+    if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) || !ui_pipeline(c, format)) return 0;
+    const uint64_t all = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, transfer = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    const uint64_t color = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    const uint64_t rw = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    const uint64_t blend = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    const VkImage image = source->image;
+    const VkImageUsageFlags blit_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const VkFormatFeatureFlags blit_features = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if (preview[2] > 0 && preview[3] > 0 && (source->usage & blit_usage) == blit_usage &&
+        (properties.optimalTilingFeatures & blit_features) == blit_features &&
+        img_ensure(c, &H.preview, (uint32_t)preview[2], (uint32_t)preview[3], format,
+                   blit_usage | VK_IMAGE_USAGE_SAMPLED_BIT)) {
+        // Only the preview rectangle needs scratch storage: a blit cannot read and overwrite overlapping regions.
+        VkImage scratch = H.preview.img;
+        barrier(cb, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                all, rw, transfer, VK_ACCESS_2_TRANSFER_READ_BIT);
+        barrier(cb, scratch, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                transfer, 0, transfer, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkImageBlit region = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                              .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+                              .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                              .dstOffsets = {{0, 0, 0}, {preview[2], preview[3], 1}}};
+        vkCmdBlitImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &region, VK_FILTER_NEAREST);
+        barrier(cb, scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                transfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, transfer, VK_ACCESS_2_TRANSFER_READ_BIT);
+        barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                transfer, VK_ACCESS_2_TRANSFER_READ_BIT, transfer, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkImageCopy copy = {.srcSubresource = region.dstSubresource, .dstSubresource = region.srcSubresource,
+                            .dstOffset = {preview[0], preview[1], 0},
+                            .extent = {(uint32_t)preview[2], (uint32_t)preview[3], 1}};
+        vkCmdCopyImage(cb, scratch, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                transfer, VK_ACCESS_2_TRANSFER_WRITE_BIT, color, blend);
+    } else {
+        memset(preview, 0, 4 * sizeof(*preview));
+        barrier(cb, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, all, rw, color, blend);
+    }
+    int composed = ui_compose(cb, target, format, w, h, (float[4]){white_scale, eotf, 1, 0});
+    barrier(cb, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, all, rw, all, rw);
+    return composed;
+}
+#endif
 
 void vk_hdr_images_release(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
-    int any = H.out.img != VK_NULL_HANDLE || H.menu.img != VK_NULL_HANDLE;
+    int any = H.out.img != VK_NULL_HANDLE;
+#ifndef GAME_OOT
+    any |= H.menu.img != VK_NULL_HANDLE;
+#endif
     for (int i = 0; i < SLOTS && !any; i++) any = H.src_view[i] != VK_NULL_HANDLE;
     if (!any) return;
     vk_queue_lock();
@@ -2132,7 +2503,9 @@ void vk_hdr_images_release(void) {
     for (int i = 0; i < SLOTS; i++)
         if (H.src_view[i]) vkDestroyImageView(c->device, H.src_view[i], NULL), H.src_view[i] = VK_NULL_HANDLE;
     img_free(c, &H.out);
+#ifndef GAME_OOT
     img_free(c, &H.menu);
+#endif
 }
 
 void vk_hdr_release(void) {
@@ -2144,8 +2517,16 @@ void vk_hdr_release(void) {
         if (H.src_view[i]) vkDestroyImageView(c->device, H.src_view[i], NULL), H.src_view[i] = VK_NULL_HANDLE;
     img_free(c, &H.out);
     img_free(c, &H.menu);
+#ifdef GAME_OOT
+    img_free(c, &H.preview);
+#endif
     if (H.enc) vkDestroyPipeline(c->device, H.enc, NULL);
-    if (H.ui) vkDestroyPipeline(c->device, H.ui, NULL);
+    while (H.ui) {
+        UiPipeline *p = H.ui;
+        H.ui = p->next;
+        vkDestroyPipeline(c->device, p->pipeline, NULL);
+        free(p);
+    }
     if (H.enc_layout) vkDestroyPipelineLayout(c->device, H.enc_layout, NULL);
     if (H.ui_layout) vkDestroyPipelineLayout(c->device, H.ui_layout, NULL);
     if (H.dsl_enc) vkDestroyDescriptorSetLayout(c->device, H.dsl_enc, NULL);

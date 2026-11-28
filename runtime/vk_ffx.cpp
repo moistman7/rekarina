@@ -31,6 +31,7 @@
 extern "C" {
 #include "cfg.h"
 #include "host.h"
+#include "platform/platform.h"
 #include "vk.h"
 #include "vk_ffx.h"
 }
@@ -46,6 +47,9 @@ struct Api {
     PfnFfxDispatch dispatch = nullptr;
     int tried = 0, ok = 0;
 } A;
+PlatMutex api_lock = PLAT_MUTEX_INIT;
+
+bool api_ready() { return __atomic_load_n(&A.ok, __ATOMIC_ACQUIRE) != 0; }
 
 void message(uint32_t type, const wchar_t *msg) {
     char s[512];
@@ -66,15 +70,13 @@ struct Up {
 
 // The upscaler versions the library offers on this device, in the order it lists them (SDK 2 only).
 struct {
-    int asked = 0, n = 0;
+    int n = 0;
     uint64_t id[16];
     char name[16][32];
     char running[32];   // the provider of the newest context (vk_ffx_running)
 } V;
 
 void versions_query() {
-    if (V.asked) return;
-    V.asked = 1;
     const VkCtx *c = vk_ctx();
     VkDeviceContext dc = {c->device, c->phys, vkGetDeviceProcAddr};
     ffxQueryDescGetVersions q = {};
@@ -117,6 +119,10 @@ uint64_t fsr_version() {
     const CfgRenderValues *settings = cfg_render_values();
     const char *want = settings ? settings->fsr_version : cfg_value("REKARINA_FSR_VERSION");
     if (!*want) return UINT64_MAX;
+#else
+    const char *want = cfg_value("REKARINA_FSR_VERSION");
+#endif
+#ifdef GAME_OOT
     const bool automatic = !strcmp(want, "auto");
     const bool ready = vk_ctx()->fsr4_ready;
     if (!ready && want[0] == '4') return UINT64_MAX;
@@ -126,10 +132,8 @@ uint64_t fsr_version() {
     const uint64_t version = listed(automatic ? "3" : want);
     return version ? version : UINT64_MAX;
 #else
-    const char *want = cfg_value("REKARINA_FSR_VERSION");
     int is_auto = !want || !*want || !strcmp(want, "auto");
     if (!vk_ctx()->fsr4_ready && (is_auto || want[0] == '4')) {
-        versions_query();
         uint64_t v3 = listed("3");
         if (listed("4") && v3) {
             static int said;
@@ -140,7 +144,6 @@ uint64_t fsr_version() {
         }
     }
     if (is_auto) return 0;
-    versions_query();
     if (uint64_t v = listed(want)) return v;
     static char told[16];
     if (strncmp(told, want, sizeof told - 1)) {
@@ -227,15 +230,20 @@ extern "C" ffxCreateContextDescHeader *vk_ffx_backend(void) {
     return &be.header;
 }
 
-extern "C" int vk_ffx_upscale_available(void) { return A.ok && fsr_version() != UINT64_MAX; }
+extern "C" int vk_ffx_upscale_available(void) { return api_ready() && fsr_version() != UINT64_MAX; }
 
-extern "C" int vk_ffx_fsr4_available(void) { return A.ok && vk_ctx()->fsr4_ready && listed("4"); }
+extern "C" int vk_ffx_fsr4_available(void) { return api_ready() && vk_ctx()->fsr4_ready && listed("4"); }
+
+extern "C" int vk_ffx_probe_fsr4(void) {
+    const VkCtx *c = vk_ctx();
+    return c && c->fsr4_ready && vk_ffx_load() && vk_ffx_fsr4_available();
+}
 
 // The menu's note beside the FSR rows: the upscaler versions this card offers ("4.1.2, 3.1.6, 2.3.4"), or the version
 // running when the list is not known. Empty before the library is asked.
 extern "C" const char *vk_ffx_versions(void) {
     static char line[256];
-    if (!A.ok) return "";
+    if (!api_ready()) return "";
     if (!V.n) return V.running;
     size_t o = 0;
     line[0] = 0;
@@ -246,12 +254,7 @@ extern "C" const char *vk_ffx_versions(void) {
 
 extern "C" const char *vk_ffx_running(void) { return V.running; }
 
-extern "C" int vk_ffx_load(void) {
-    if (A.tried) {
-        if (A.ok && vk_ctx() && vk_ctx()->device) versions_query();
-        return A.ok;
-    }
-    A.tried = 1;
+static int load_api() {
     const char *lib = "amd_fidelityfx_loader_vk.dll";
 #ifdef _WIN32
     char path[MAX_PATH];
@@ -270,10 +273,26 @@ extern "C" int vk_ffx_load(void) {
     A.query = (PfnFfxQuery)(void *)GetProcAddress(m, "ffxQuery");
     A.dispatch = (PfnFfxDispatch)(void *)GetProcAddress(m, "ffxDispatch");
 #endif
-    A.ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
-    rt_log("ffx: %s %s", lib, A.ok ? "loaded (FSR SDK 2)" : "lacks the API entry points: FSR off");
-    if (A.ok && vk_ctx() && vk_ctx()->device) versions_query();
-    return A.ok;
+    const int ok = A.create && A.destroy && A.configure && A.query && A.dispatch;
+    rt_log("ffx: %s %s", lib, ok ? "loaded (FSR SDK 2)" : "lacks the API entry points: FSR off");
+    if (ok) versions_query();
+    return ok;
+}
+
+extern "C" int vk_ffx_load(void) {
+    if (api_ready()) return 1;
+    if (!vk_ctx()) {
+        rt_log("ffx: cannot load before Vulkan device initialization");
+        return 0;
+    }
+    plat_mutex_lock(&api_lock);
+    if (!A.tried) {
+        A.tried = 1;
+        __atomic_store_n(&A.ok, load_api(), __ATOMIC_RELEASE);
+    }
+    const int ok = api_ready();
+    plat_mutex_unlock(&api_lock);
+    return ok;
 }
 
 extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const VkFfxImage *depth, const VkFfxImage *mv,
@@ -294,10 +313,11 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
     d.renderSize = {color->width, color->height};
     d.upscaleSize = {out->width, out->height};
     if (debug_view()) d.flags |= FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
-    // The sharpness slider (0-100) drives FSR's own RCAS here, as it does for FSR 1
+#ifndef GAME_OOT
     int sharp = cfg_int("REKARINA_SHARPNESS");
     d.enableSharpening = sharp > 0;
     d.sharpness = sharp > 100 ? 1.0f : sharp / 100.0f;
+#endif
     d.frameTimeDelta = dt_ms;
     d.preExposure = 1.0f;
     d.reset = reset != 0;
@@ -317,19 +337,19 @@ extern "C" int vk_ffx_upscale(VkCommandBuffer cb, const VkFfxImage *color, const
 extern "C" ffxReturnCode_t vk_ffx_create(ffxContext *ctx, ffxCreateContextDescHeader *desc) {
     return vk_ffx_load() ? A.create(ctx, desc, nullptr) : FFX_API_RETURN_ERROR;
 }
-extern "C" ffxReturnCode_t vk_ffx_destroy(ffxContext *ctx) { return A.ok ? A.destroy(ctx, nullptr) : FFX_API_RETURN_ERROR; }
+extern "C" ffxReturnCode_t vk_ffx_destroy(ffxContext *ctx) { return api_ready() ? A.destroy(ctx, nullptr) : FFX_API_RETURN_ERROR; }
 extern "C" ffxReturnCode_t vk_ffx_configure(ffxContext *ctx, const ffxConfigureDescHeader *desc) {
-    return A.ok ? A.configure(ctx, desc) : FFX_API_RETURN_ERROR;
+    return api_ready() ? A.configure(ctx, desc) : FFX_API_RETURN_ERROR;
 }
 extern "C" ffxReturnCode_t vk_ffx_query(ffxContext *ctx, ffxQueryDescHeader *desc) {
-    return A.ok ? A.query(ctx, desc) : FFX_API_RETURN_ERROR;
+    return api_ready() ? A.query(ctx, desc) : FFX_API_RETURN_ERROR;
 }
 extern "C" ffxReturnCode_t vk_ffx_dispatch(ffxContext *ctx, const ffxDispatchDescHeader *desc) {
-    return A.ok ? A.dispatch(ctx, desc) : FFX_API_RETURN_ERROR;
+    return api_ready() ? A.dispatch(ctx, desc) : FFX_API_RETURN_ERROR;
 }
 
 extern "C" void vk_ffx_release(void) {
-    if (!A.ok) return;
+    if (!api_ready()) return;
     for (Up &u : U)
         if (u.ctx) A.destroy(&u.ctx, nullptr), u.ctx = nullptr;
 }

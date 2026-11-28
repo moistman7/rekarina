@@ -163,7 +163,8 @@ static void meter_collect(uint64_t done, uint64_t now) {
 
 VkDescriptorBufferInfo vk_hdr_meter_bind(VkExec *ex) {
     Nits n = nits();
-    int enabled = vk_hdr_active() && n.tm[17] == 2.0f;
+    int enabled = (vk_hdr_renodx_scene() || vk_hdr_sdr_scene()) &&
+                  !strcmp(cfg_value("REKARINA_HDR_MIDGRAY"), "adaptation");
     VkDescriptorBufferInfo result = {0};
     plat_mutex_lock(&A.lock);
     if (!enabled) {

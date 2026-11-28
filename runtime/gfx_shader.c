@@ -81,6 +81,14 @@ struct GfxShader {
     uint8_t key[32];
     uint8_t iid[32];                                       // input id (see the keys at the top)
     uint32_t *spirv;
+#ifdef GAME_OOT
+    struct GfxShader *renodx[4];
+    unsigned renodx_checked;
+    struct GfxShader *renodx_aa[GFX_HDR_AA_ROLES];
+    struct GfxShader *aa_mask;
+    int aa_mask_checked;
+    unsigned renodx_aa_checked;
+#endif
     uint8_t dbg;                   // DEBUG-UVDEBUG: the module was patched to write (u, v, alpha)
     uint64_t words;
     char *reflection;                                      // the service's .res.json text, parsed into the fields below
@@ -574,6 +582,10 @@ static GfxShader *mem_find(const uint8_t key[32]) {
 }
 
 static void shader_free(GfxShader *s) {
+#ifdef GAME_OOT
+    for (unsigned i = 0; i < sizeof s->renodx / sizeof *s->renodx; ++i)
+        if (s->renodx[i]) shader_free(s->renodx[i]);
+#endif
     for (int k = 0; k < GFX_RES_KINDS; k++) free(s->res[k]);
     free(s->spirv), free(s->reflection), free(s);
 }
@@ -668,16 +680,9 @@ static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int 
     s->reflection = (char *)res;
     s->reflection_size = res_size;
     reflect(s);
-    // Patch only the in-memory copy. The shader cache keeps the original module and reflection.
-    int binding = s->stage == GFX_STAGE_FS ? vk_hdr_shader_swap(&s->spirv, &s->words) : 0;
-    if (binding) {
-        int n = s->nres[GFX_RES_SSBO];
-        GfxShaderRes *res = realloc(s->res[GFX_RES_SSBO], (n + 1) * sizeof *res);
-        if (!res) rt_fatal("gfx_shader: out of memory adding the HDR eye adaptation binding");
-        res[n] = (GfxShaderRes){.binding = (uint16_t)binding, .slot = -1, .flags = 1, .cbuf_slot = GFX_CB_HDR_METER};
-        s->res[GFX_RES_SSBO] = res;
-        s->nres[GFX_RES_SSBO] = n + 1;
-    }
+#ifndef GAME_OOT
+    if (s->stage == GFX_STAGE_FS) vk_hdr_shader_swap(&s->spirv, &s->words);
+#endif
     return s;
 }
 
@@ -699,6 +704,123 @@ const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const cha
     reflect(s);
     return s;
 }
+
+#ifdef GAME_OOT
+int gfx_shader_guest_pq(const GfxShader *s) {
+    static const uint8_t pq[32] = {
+        0x8e, 0x36, 0x68, 0xf6, 0x70, 0x5e, 0x56, 0x87, 0x1f, 0xd7, 0x69, 0x7c, 0x69, 0x6d, 0xad, 0xd5,
+        0xf2, 0x8d, 0xe1, 0x84, 0xd1, 0xca, 0x20, 0x8b, 0x5b, 0xee, 0x96, 0x36, 0x37, 0xc3, 0xd5, 0xe7,
+    };
+    return s && s->stage == GFX_STAGE_FS && !memcmp(s->iid, pq, sizeof pq);
+}
+
+const GfxShader *gfx_shader_renodx_variant(const GfxShader *s, GfxRenodxVariant kind) {
+    if (!s || s->stage != GFX_STAGE_FS || gfx_shader_guest_pq(s)) return s;
+    unsigned slot = (unsigned)kind;
+    unsigned bit = 1u << slot;
+    if (__atomic_load_n(&s->renodx_checked, __ATOMIC_ACQUIRE) & bit)
+        return s->renodx[slot] ? s->renodx[slot] : s;
+    GfxShader *base = (GfxShader *)s;
+    plat_mutex_lock(&cache_lock);
+    if (!(__atomic_load_n(&base->renodx_checked, __ATOMIC_RELAXED) & bit)) {
+        uint64_t words = s->words;
+        uint32_t *code = malloc((size_t)words * sizeof *code);
+        int failed = !code;
+        int meter_binding = 0;
+        if (code) {
+            memcpy(code, s->spirv, (size_t)words * sizeof *code);
+            int spliced = vk_hdr_scene_splice(&code, &words, kind, &meter_binding);
+            failed = spliced <= 0;
+            if (spliced > 0)
+                base->renodx[slot] = (GfxShader *)gfx_shader_own(code, words, s->reflection);
+            free(code);
+        }
+        GfxShader *variant = base->renodx[slot];
+        if (variant) {
+            memcpy(variant->iid, s->iid, sizeof s->iid);
+            if (meter_binding) {
+                int n = variant->nres[GFX_RES_SSBO];
+                GfxShaderRes *res = realloc(variant->res[GFX_RES_SSBO], (n + 1) * sizeof *res);
+                if (!res) rt_fatal("gfx_shader: out of memory adding the HDR eye adaptation binding");
+                res[n] = (GfxShaderRes){.binding = (uint16_t)meter_binding, .slot = -1, .flags = 1, .cbuf_slot = GFX_CB_HDR_METER};
+                variant->res[GFX_RES_SSBO] = res;
+                variant->nres[GFX_RES_SSBO] = n + 1;
+            }
+        }
+        static const char *const names[] = {"RenoDX HDR scene mapper", "Vanilla scene effects", "RenoDX SDR scene mapper", "Vanilla scene grading"};
+        const char *name = names[kind];
+        if (variant) rt_log("hdr: built %s variant %02x%02x%02x%02x%s", name,
+                            s->iid[0], s->iid[1], s->iid[2], s->iid[3], meter_binding ? " with eye adaptation" : "");
+        else if (failed) rt_log("hdr: %s variant unavailable for %02x%02x%02x%02x", name,
+                                 s->iid[0], s->iid[1], s->iid[2], s->iid[3]);
+        __atomic_fetch_or(&base->renodx_checked, bit, __ATOMIC_RELEASE);
+    }
+    const GfxShader *variant = base->renodx[slot];
+    plat_mutex_unlock(&cache_lock);
+    return variant ? variant : s;
+}
+
+const GfxShader *gfx_shader_renodx_aa(const GfxShader *s, unsigned role) {
+    if (!s || s->stage != GFX_STAGE_CS || role >= GFX_HDR_AA_ROLES) return NULL;
+    const int store = role == GFX_HDR_AA_STORE;
+    const unsigned expected[] = {5, 6, 18};
+    int slot = store ? 1 : 3;
+    const GfxShaderRes *r;
+    int n = gfx_shader_resources(s, store ? GFX_RES_IMG : GFX_RES_TEX, &r);
+    int binding = -1;
+    for (int i = 0; i < n; ++i) {
+        if (r[i].slot != slot) continue;
+        if (binding >= 0 || r[i].set != 0 || r[i].type != 3 || r[i].separate || r[i].count > 1 ||
+            (store && (!(r[i].flags & 4) || r[i].format))) return NULL;
+        binding = r[i].binding;
+    }
+    if (binding < 0) return NULL;
+    GfxShader *base = (GfxShader *)s;
+    plat_mutex_lock(&cache_lock);
+    if (!(base->renodx_aa_checked & (1u << role))) {
+        base->renodx_aa_checked |= 1u << role;
+        uint64_t words = s->words;
+        uint32_t *code = malloc((size_t)words * sizeof *code);
+        if (code) {
+            memcpy(code, s->spirv, (size_t)words * sizeof *code);
+            if (vk_hdr_aa_splice(&code, &words, (unsigned)binding, expected[role], store))
+                base->renodx_aa[role] = (GfxShader *)gfx_shader_own(code, words, s->reflection);
+            free(code);
+        }
+        if (base->renodx_aa[role]) memcpy(base->renodx_aa[role]->iid, s->iid, sizeof s->iid);
+    }
+    const GfxShader *variant = base->renodx_aa[role];
+    plat_mutex_unlock(&cache_lock);
+    return variant;
+}
+
+const GfxShader *gfx_shader_aa_mask(const GfxShader *s) {
+    GfxShader *base = (GfxShader *)s;
+    plat_mutex_lock(&cache_lock);
+    if (!base->aa_mask_checked) {
+        base->aa_mask_checked = 1;
+        int binding = -1;
+        for (int i = 0; i < s->nres[GFX_RES_TEX]; ++i) {
+            const GfxShaderRes *r = &s->res[GFX_RES_TEX][i];
+            if (r->slot == 4 && r->set == 0 && r->type == 3 && !r->separate && r->count <= 1) binding = r->binding;
+        }
+        if (binding >= 0) {
+            uint64_t words = s->words;
+            uint32_t *code = malloc((size_t)words * sizeof *code);
+            if (!code) rt_fatal("gfx_shader: out of memory preparing the edge-mask shader");
+            memcpy(code, s->spirv, (size_t)words * sizeof *code);
+            if (vk_aa_mask_splice(&code, &words, (unsigned)binding))
+                base->aa_mask = (GfxShader *)gfx_shader_own(code, words, s->reflection);
+            free(code);
+        }
+        if (base->aa_mask) memcpy(base->aa_mask->iid, s->iid, sizeof s->iid);
+        else rt_log("gfx_shader: could not repair the unsigned edge-mask sampler");
+    }
+    const GfxShader *variant = base->aa_mask;
+    plat_mutex_unlock(&cache_lock);
+    return variant;
+}
+#endif
 
 int gfx_shader_meshc(const GfxShader *s, uint32_t *vec4s, uint32_t *max_meshlets, const uint8_t **locs) {
     if (!s || s->stage != GFX_STAGE_MSC || !s->emu_vec4s || !s->emu_max) return 0;
@@ -2823,16 +2945,6 @@ uint64_t gfx_shader_async_done(void) { return (uint64_t)n_async; }
 void gfx_shader_counts(uint64_t *keys, uint64_t *translated) { *keys = (uint64_t)n_keys, *translated = (uint64_t)n_xlated; }
 
 const uint8_t *gfx_shader_key(const GfxShader *s) { return s->key; }
-
-#ifdef GAME_OOT
-int gfx_shader_guest_pq(const GfxShader *s) {
-    static const uint8_t pq[32] = {
-        0x8e, 0x36, 0x68, 0xf6, 0x70, 0x5e, 0x56, 0x87, 0x1f, 0xd7, 0x69, 0x7c, 0x69, 0x6d, 0xad, 0xd5,
-        0xf2, 0x8d, 0xe1, 0x84, 0xd1, 0xca, 0x20, 0x8b, 0x5b, 0xee, 0x96, 0x36, 0x37, 0xc3, 0xd5, 0xe7,
-    };
-    return s && s->stage == GFX_STAGE_FS && !memcmp(s->iid, pq, sizeof pq);
-}
-#endif
 
 const uint8_t *gfx_shader_input_id(const GfxShader *s) { return s->iid; }
 

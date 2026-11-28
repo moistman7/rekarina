@@ -1559,8 +1559,8 @@ static int par_take_run(int prio) {
         if (prio > 0) plat_thread_priority(prio > 1 ? PLAT_PRIO_HIGHEST : PLAT_PRIO_ABOVE_NORMAL);
         par_run(&PAR.job[i]);
         if (prio > 0) plat_thread_priority(PLAT_PRIO_NORMAL);
-        __atomic_store_n(&PAR.jstate[i], 3, __ATOMIC_RELEASE);
         __atomic_fetch_add(&PAR.ndone, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&PAR.jstate[i], 3, __ATOMIC_RELEASE);
         return 1;
     }
     return 0;
@@ -1716,6 +1716,10 @@ static const op_hdr *exec_op_(VkExec *ex, const op_hdr *h, int depth, int holdab
 // A stretch that begins at the draw op h: handed out in chunks, and the op after it returned; NULL: h is replayed as
 // always.
 static const op_hdr *par_try(VkExec *ex, const op_hdr *h) {
+#ifdef GAME_OOT
+    // Later draws may overwrite a checked output through an attachment or a storage image.
+    if (vk_hdr_output_pending()) return NULL;
+#endif
     if (h >= PAR.no_from && h < PAR.no_until) return NULL;
     uint32_t nd = 0, nc = 0;
 #ifdef GAME_OOT
@@ -1731,7 +1735,7 @@ static const op_hdr *par_try(VkExec *ex, const op_hdr *h) {
                             op == OP_DRAW_IDX ? ((const p_draw_idx *)draw_payload)->draw_role :
                             op == OP_DRAW_IDX_IND ? ((const p_draw_idx_ind *)draw_payload)->draw_role : 0;
             // Scene output and bloom draws publish ordered resource handoffs on the replay thread.
-            if ((role & ~DRAW_ROLE_INTERFACE) || (role && vk_interface_coverage_enabled())) break;
+            if ((role & ~DRAW_ROLE_INTERFACE) || (role && ex->interface_coverage)) break;
             nd++;
             continue;
         }
@@ -1763,16 +1767,7 @@ static const op_hdr *par_try(VkExec *ex, const op_hdr *h) {
         ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
         vk_exec_pass_begin(ex);
     }
-    if (ex->pass_noatt || ex->nfbl || ex->fbl_mask || vk_interface_coverage_serial_required()) return NULL;
-#ifdef GAME_OOT
-    // ADR-0001: serialize only when Guest PQ / RT_TRACE_GFX Output Proof is pending AND this stretch can overwrite it.
-    if (__builtin_expect(vk_hdr_output_pending_frame != 0, 0) && vk_hdr_output_pending()) {
-        if (has_img_bind) return NULL;
-        for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++)
-            if (vk_hdr_output_targets_pending(ex->color[i].image, ex->color[i].img ? ex->color[i].img->addr : 0))
-                return NULL;
-    }
-#endif
+    if (ex->pass_noatt || ex->nfbl || ex->fbl_mask || vk_interface_coverage_serial_required(ex)) return NULL;
     for (uint32_t i = 0; i < ex->pass_ncolor && i < 8; i++)
         if (ex->color[i].image && ex->color[i].img && ex->color[i].img->image != ex->color[i].image) return NULL;
     uint64_t t0 = plat_now_ns();
@@ -1949,7 +1944,7 @@ static const op_hdr *exec_op_(VkExec *ex, const op_hdr *h, int depth, int holdab
         const void *a = nvn_op_payload(h);
         vk_exec_cur_op = h;
         if (PAR.active && par_join_op(h->op)) par_why = 1 + (int)h->op, vk_exec_par_join();
-        if (!depth && par_is_draw(h->op) && x_here && par_on() && !vk_interface_coverage_serial_required()) {
+        if (!depth && par_is_draw(h->op) && x_here && par_on() && !vk_interface_coverage_serial_required(ex)) {
             const op_hdr *after = par_try(ex, h);
             if (after) return after;
         }
@@ -2084,7 +2079,7 @@ static void part_split(VkExec *ex) {
     n_parts++;
 }
 void vk_exec_results_point(VkExec *ex) {
-    if (x_res_point || !x_here || vk_exec_ac_value || !vk_sync_results_on()) return;
+    if (vk_par_worker || x_res_point || !x_here || vk_exec_ac_value || !vk_sync_results_on()) return;
     {   // not while the GPU reads the game's live memory (vk_memory.c vk_mem_host_read_note); REKARINA_RESULTS_HOST=1: anyway
         static int anyway = -1;
         static uint64_t left_out, taken;
@@ -2419,12 +2414,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     const CfgRenderState *settings = cfg_render_current() ? NULL : cfg_render_frame_acquire();
     const CfgRenderState *previous = settings ? cfg_render_use(settings) : cfg_render_current();
     __atomic_fetch_add(&vk_exec_busy, 1, __ATOMIC_ACQ_REL);
-    static unsigned aniso_revision = ~0u;
-    const unsigned revision = cfg_version();
-    if (n && aniso_revision != revision) {
-        vk_sampler_anisotropy();
-        aniso_revision = revision;
-    }
+    if (n) vk_dlaa_frame_settings();
     int r = exec_record_(cb, handles, n, fence);
     __atomic_fetch_sub(&vk_exec_busy, 1, __ATOMIC_ACQ_REL);
     cfg_render_use(previous);
@@ -2480,6 +2470,13 @@ static int exec_record_(VkCommandBuffer cb, const uint64_t *handles, int n, uint
     runlog(handles, n);
     VkExec *ex = &X;
     if (!x_ready) state_reset(ex), vk_dump_init(), x_ready = 1;
+#ifdef GAME_OOT
+    const CfgRenderValues *settings = cfg_render_values();
+    ex->motion_models = settings && settings->motion_models;
+    ex->motion_reverse_only = settings && settings->motion_reverse_only;
+    ex->prebloom_tonemap = vk_dlaa_prebloom_enabled() && !vk_dlaa_fsr1();
+    ex->interface_coverage = settings && (settings->consumers & CFG_RENDER_INTERFACE_COVERAGE);
+#endif
     if (interleave < 0) {
         interleave = rt_knob("QUEUE_INTERLEAVE", "1");
         rt_log("vk: queues interleaved at their event waits: %s (REKARINA_QUEUE_INTERLEAVE)", interleave ? "on" : "off");

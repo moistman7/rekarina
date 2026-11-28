@@ -172,9 +172,10 @@
 # 3D render scale: the scene's size relative to the game resolution, game (5/6, the game's own 1600x900 at 1080p) or
 # a percentage (25 to 400, at most 4096 pixels a side); above 100 supersamples the scene (anti-aliasing). Read at start.
 # render_scale = game
-# Scaling to the window when it is larger than the game resolution: fsr (AMD FSR 1) or bilinear, and FSR's sharpening
-# from 0 (off) to 100. Changes while the game runs take effect at once.
+# Scaling to the window when it is larger than the game resolution: fsr (AMD FSR 1) or bilinear.
 # upscaler = fsr
+# RCAS strength, 0 to 100 (0 disables it, 80 is the default). OoT applies it before the HUD except when NDSR runs.
+# TotK uses it for FSR display scaling and for texture bias below 80. Changes apply live.
 # sharpness = 80
 # OoT only: legacy storage for Texture Mip Bias Correction. 100 adds 0 mips; 0 adds +0.5 mips toward zero.
 # texture_lod_strength = 100
@@ -201,9 +202,9 @@
 # fov = 100
 # Anisotropic filtering of surface textures: game (the level the game asks for, as on the Switch) or 2, 4, 8, 16. Keeps
 # ground, roads and walls seen at a shallow angle sharp into the distance. Only filtered, mipmapped textures that tile
-# are raised; shadow maps, data maps and screen-sized buffers keep the game's setting. Changes live.
+# are raised; shadow maps, data maps and screen-sized buffers keep the game's setting. Read at start.
 # aniso = game
-# Colour adjustment of the picture, HUD included, before it is scaled to the window: brightness (-30 to 30, added in %),
+# TotK only: colour adjustment of the picture, HUD included, before it is scaled to the window: brightness (-30 to 30, added in %),
 # contrast and saturation (70 to 150 and 50 to 200 %), gamma (0.8 to 1.2, below 1 brightens dark tones). At 0, 100,
 # 100 and 1 nothing runs. color_preset is the menu's profile (default, vivid, clarity, custom), which sets the four.
 # Changes while the game runs take effect at once.
@@ -239,12 +240,14 @@
 # NVIDIA DLSS / DLAA for the 3D scene, on NVIDIA RTX GPUs with the DLSS model from NVIDIA's DLSS SDK next to the
 # executable (Windows: nvngx_dlss.dll next to rekarina.exe; Linux: libnvidia-ngx-dlss.so.<version> next to totk, with the
 # NVIDIA driver's libnvidia-ngx.so.1 installed); elsewhere the setting does nothing. The HUD is drawn after it and is not touched.
-# Read at start.
+# The switch and the upscaler backend (taa) apply live in OoT; they are read at start in TotK.
 # dlaa = 0
 # Frame generation (OoT): off, dlss (NVIDIA DLSS Frame Generation, RTX 40 and 50 cards) or fsr3 (AMD FSR 3.1 frame
 # generation, any card). Either takes DLSS / DLAA's depth and motion vectors and turns dlaa on for itself; dlss where
 # DLSS Frame Generation cannot run (an RTX 20 or 30 card, an older driver) runs AMD's in its place. Read at start.
 # framegen = off
+# OoT: separate the HUD and overlay for supported DLSS Frame Generation. On by default; changes require a restart.
+# dlss_interface_recomposition = 1
 # NVIDIA Reflex low latency (NVIDIA GPUs with VK_NV_low_latency2 or Streamline): 0 = off, 1 = on, 2 = on + boost
 # (keeps GPU clocks elevated when CPU-limited). Kept on while DLSS Frame Generation is active. Changes apply live.
 # reflex = 1
@@ -266,56 +269,49 @@
 # pre-bloom disabled. It resolves at the original scene resolution before bloom; if its checks fail, the game's
 # scaler runs. Read at start.
 # dlaa_pre_bloom = 0
+# OoT: checked reconstruction before bloom covers scenes that bypass the gameplay scaler.
+# dlss_prebloom = 1
 # TotK only: the game's own FXAA after the post effects (fxaa = 0 leaves it out). OoT's own anti-aliasing is another
 # pass that this setting does not reach, so the settings menu has no such row there.
 # fxaa = 1
 
-# HDR output (OoT): 0 = SDR, 1 = RenoDX HDR (HDR10 swapchain with RenoDX tone mapping, switches live while
-# hdr_live = 1), native = the game's own PQ Rec. 2020 HDR output (read at start). Needs HDR turned on in Windows
-# ("Use HDR") or a Wayland compositor with colour management; without it the picture stays SDR.
+# HDR output (OoT): 0 = SDR, 1 = HDR. hdr_tonemap chooses the HDR compositor: Vanilla uses R11G11B10F,
+# PsychoV35 uses signed RGBA16F. Old hdr = native maps to hdr = 1 with hdr_tonemap = vanilla.
+# The game encodes the visible HDR10 picture. The signal and tonemapper switch without restarting.
+# Needs HDR turned on in Windows ("Use HDR") or a Wayland compositor with colour management.
 # hdr = 0
-# Arm HDR extensions and spliced tonemap at start so hdr = 0/1 can toggle live without restarting (0 disables live arming).
-# hdr_live = 1
-# Display peak brightness in nits (400 to 10000), game white / paper white (48 to 500; 203 is the BT.2408 reference),
-# and HUD / menu white (48 to 500). All apply live.
+# Display peak brightness in nits (400 to 10000), HDR Reference White (48 to 500; 203 is the BT.2408 reference),
+# and host menu white (48 to 500). All apply live.
 # hdr_peak_nits = 1000
 # hdr_game_nits = 203
 # hdr_ui_nits = 203
-# Display gamma correction on the HDR10 present: 2.2 (default), 2.4, or off (sRGB decode).
-# hdr_gamma = 2.2
-# Interpret the HDR scene's primaries as Rec. 709 or Display P3 (bt709 or p3).
-# hdr_color_space = bt709
-# RenoDX tone mapper: psychov35 (observer-response cone mapper, default), renodrt (Daniele luminance mapper + OkLab
-# grading), or vanilla (the game's ACES curve scaled to game brightness).
+# Render EOTF Emulation for PsychoV35 HDR only: off (default), 2.2, or 2.4.
+# hdr_gamma = off
+# UI EOTF Emulation for PsychoV35 HDR: off (sRGB), 2.2 (default), or 2.4. Vanilla uses the native EOTF.
+# hdr_ui_eotf = 2.2
+# OoT scene tonemapper remembered separately for SDR and HDR: vanilla (game ACES) or psychov35.
+# sdr_tonemap = vanilla
 # hdr_tonemap = psychov35
-# PsychoV35 parameters: mid-grey anchor (vanilla, render or adaptation), match the game's ACES tone slope (0 or 1), tone slope
+# Bloom works in SDR and HDR with either mapper; the menu displays 0 to 200%. Local exposure is INI-only and applies to Vanilla HDR; leaving the key unset
+# keeps the game's local exposure. For both controls 50 matches the game and 100 doubles the effect.
+# hdr_bloom = 50
+# hdr_local_exposure = 50
+# PsychoV35 parameters: mid-grey anchor (vanilla, render, or adaptation), match the game's ACES tone slope (0 or 1), tone slope
 # multiplier (0 to 100; 50 = 1.0x), and vanilla highlight hue clip emulation (0 to 100 percent).
 # hdr_midgray = vanilla
-# Eye adaptation uses the pre-tone-map scene to adjust the mid-grey anchor over time. Set the output target as a
-# percentage of game white and set its limits in stops relative to that target.
 # hdr_adaptation_target = 18
 # hdr_adaptation_min_stops = -4
 # hdr_adaptation_max_stops = 2
 # hdr_match_slope = 1
 # hdr_tone_slope = 50
 # hdr_hue_clip = 50
-# Grading sliders shared by PsychoV35 and RenoDRT: highlights, shadows, contrast, and saturation
-# (0 to 100, 50 = neutral). Exposure is -3 to +3 EV in the menu, or 0 to 800 percent in the INI (100 is neutral).
+# Shared SDR/HDR scene grading: exposure (menu: -3 to +3 EV; INI: 0 to 800 percent, 100 = neutral), highlights, shadows,
+# contrast, and saturation (0 to 100, 50 = neutral). Vanilla grades before ACES; PsychoV35 grades internally.
 # hdr_exposure = 100
 # hdr_highlights = 50
 # hdr_shadows = 50
 # hdr_contrast = 50
 # hdr_saturation = 50
-# RenoDRT parameters: highlight saturation (0 to 100, 50 = neutral), blowout (0 to 100 percent), flare (0 to 100),
-# highlight hue correction (0 to 100 percent), and vanilla grade strength (0 to 100 percent).
-# hdr_highlight_sat = 50
-# hdr_blowout = 0
-# hdr_flare = 0
-# hdr_hue = 100
-# hdr_grade = 100
-# Game bloom strength and local exposure in Vanilla and RenoDRT (0 to 100, 50 matches the game).
-# hdr_bloom = 50
-# hdr_local_exposure = 50
 
 [language]
 # Language: a Windows locale such as de-DE, or a Switch code (en-US, ja, zh-Hant, ...). Default: the Windows locale.

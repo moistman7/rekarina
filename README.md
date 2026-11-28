@@ -74,8 +74,8 @@ Numbers from another machine are welcome: [docs/performance.md](docs/performance
 - **NVIDIA DLSS, DLAA, and DLSS Frame Generation** through Streamline. Projection jitter and tracked motion
   vectors give DLSS subpixel samples and motion for moving objects, including skinned characters.
 - **RenoDX HDR** tone maps the scene before presentation and outputs HDR10. With HDR enabled on the display,
-  select RenoDX in the F1 Screen tab for live paper-white, peak brightness, colour space, and bloom controls.
-  Vanilla and RenoDRT expose local exposure, and PsychoV35 offers eye adaptation with adjustable limits.
+  open Graphics from the F1 menu for live paper white, peak brightness, and bloom controls.
+  PsychoV35 fits to BT.2020 and offers optional eye adaptation. Bloom works with both mappers; local exposure is Vanilla-only.
 - **Performance fixes and tuning** focus on the Vulkan renderer and frame pacing.
 - **Native code, not emulation**: 100+ fps where the console runs at 60, a frame limit up to 240 or the monitor's rate
 - **Smooth above 60 fps**: the game's own clock follows real time, and the places where it counted frames are

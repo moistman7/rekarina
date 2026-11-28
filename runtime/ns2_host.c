@@ -34,11 +34,25 @@ static uint64_t bound_event(Cpu *c, int signalled) {   // a SystemEvent the host
 // ---- vi: HDR, VRR, refresh rate.
 static int vi_hdr_capability(void) {
 #ifdef GAME_OOT
-    return vk_hdr_native() && gfx_hdr_surface_capable();
+    return vk_hdr_wanted() && gfx_hdr_surface_capable();
 #else
-    return vk_hdr_native();
+    return 0;
 #endif
 }
+
+#ifdef GAME_OOT
+void ns2_hdr_capability_changed(void) {
+    static int previous = -1, previous_signed;
+    int capability = vi_hdr_capability();
+    int signed_compositor = capability && !vk_hdr_native();
+    rt_patch_switch(rt_patch_set("hdr_compositor"), signed_compositor);
+    if (previous >= 0 && (previous != capability || previous_signed != signed_compositor))
+        oe_push_message(OE_MSG_OPERATION_MODE_CHANGED);
+    previous = capability;
+    previous_signed = signed_compositor;
+}
+#endif
+
 // Result QueryDisplayHdrStatus(bool *on, HdrOutputFormat *fmt, u16 *peak, const Display *)
 static void vi_hdr_status(Cpu *c) {
     const CfgRenderState *settings = cfg_render_frame_acquire();

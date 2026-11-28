@@ -78,7 +78,7 @@ static int reflex_mode(void) {
 int vk_dlssg_reflex_available(void) { return S.active && S.reflex != NULL; }
 
 void vk_dlssg_reflex_sync(void) {
-    if (!vk_dlssg_owns_swapchain() || !S.reflex) return;
+    if (!S.active || !S.reflex) return;
     int m = reflex_mode();
     if (m == S.reflex_applied) return;
     S.reflex_applied = m;
@@ -330,9 +330,8 @@ void vk_dlssg_device_ready(VkDevice dev) {
 }
 
 int vk_dlssg_swapchain_ready(void) { return S.active; }
-int vk_dlssg_owns_swapchain(void) { return S.active && !vk_fg_swapchain(); }
 int vk_dlssg_active(void) {
-    if (!vk_dlssg_owns_swapchain()) return 0;
+    if (!S.active || vk_fg_swapchain()) return 0;
     // UI coverage checks this during draw replay; resolve the setting only after configuration changes.
     static _Thread_local unsigned seen;
     static _Thread_local int selected = -1;
@@ -398,10 +397,7 @@ VkResult vk_dlssg_create_swapchain(VkDevice d, const VkSwapchainCreateInfoKHR *c
     if (guard_setup) fg_guard_arm(FG_GUARD_DLSS);
 #endif
     VkResult r = S.create_sc(d, ci, NULL, sc);
-    if (r == VK_SUCCESS) {
-        S.reflex_applied = -1;
-        vk_dlssg_reflex_sync();
-    }
+    if (r == VK_SUCCESS) vk_dlssg_reflex_sync();
 #ifdef GAME_OOT
     if (guard_setup) fg_guard_disarm(FG_GUARD_DLSS);
 #endif
@@ -429,7 +425,7 @@ VkResult vk_dlssg_present(VkQueue q, const VkPresentInfoKHR *pi) {
 // and the sleep would wait out Streamline's half-second timeout each frame.
 #define HOLD_IDLE_NS 200000000ull
 void vk_dlssg_frame_start(void) {
-    if (!vk_dlssg_owns_swapchain() || !S.present) return;
+    if (!S.active || !S.present) return;
     vk_dlssg_reflex_sync();
     uint32_t f = __atomic_load_n(&S.game, __ATOMIC_RELAXED) + 1;
     if (f == S.started) return;
@@ -441,24 +437,22 @@ void vk_dlssg_frame_start(void) {
 void vk_dlssg_game_present(void) { __atomic_add_fetch(&S.game, 1, __ATOMIC_RELAXED); }
 
 void vk_dlssg_submitted(uint64_t frame) {
-    if (vk_dlssg_owns_swapchain() && S.present) S.submit_end((uint32_t)frame);
+    if (S.active && S.present) S.submit_end((uint32_t)frame);
 }
 
 void vk_dlssg_present_frame(uint64_t frame) { S.cur = (uint32_t)frame; }
 
 uint64_t vk_dlssg_shown(void) { return vk_dlssg_active() ? S.shown() : 0; }
 
-int vk_dlssg_interface_coverage_available(void) { return S.frame_with_interface && vk_dlssg_active(); }
+int vk_dlssg_interface_coverage_available(void) { return S.active && S.frame_with_interface; }
 
 int vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, VkImage hudless, VkImageView hudless_view, VkFormat hudless_fmt,
                    VkImage interface_coverage, VkImageView interface_coverage_view) {
-    static int went_on, was_on;
-    if (!vk_dlssg_owns_swapchain()) {
-        went_on = was_on = 0;
-        return 0;
-    }
+    if (!S.active) return 0;
     int selected = vk_dlssg_active();
-    if (selected) vk_dlaa_hudless_wanted = 1;   // the upscaling pass keeps a copy of the picture before the HUD
+#ifndef GAME_OOT
+    if (selected) vk_dlaa_hudless_wanted = 1;
+#endif
     VkFfxImage d = {0}, m = {0};
     VkImageView dv = VK_NULL_HANDLE, mvv = VK_NULL_HANDLE;
     VkDlaaCamera c;
@@ -468,6 +462,7 @@ int vk_dlssg_frame(VkCommandBuffer cb, VkExtent2D ext, VkImage hudless, VkImageV
     // Off in every frame without the inputs: the game's pause screens have no camera, and generation kept on there
     // blended whole frames of them. The library keeps the resources while it is off (nx2_sl.h version 4+), so on again
     // costs nothing, and the first frame back starts generation's history anew (reset).
+    static int went_on, was_on;
     int on = selected && (have || (went_on && !S.retains));
     if (!selected) went_on = 0;
     else if (on) went_on = 1;

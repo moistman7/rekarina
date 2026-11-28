@@ -96,11 +96,8 @@ void cfg_render_publish_present(unsigned (*resolve_consumers)(CfgTaa taa, int wa
                 ((consumers & CFG_RENDER_FRAMEGEN_MOTION) || ((consumers & CFG_RENDER_UPSCALER) && taa != CFG_TAA_FSR1));
 #ifdef GAME_OOT
             if (!strcmp(cfg_value(PREFIX "HDR"), "1")) {
-                const char *input = cfg_value(PREFIX "HDR_COLOR_SPACE");
                 if (strcmp(cfg_value(PREFIX "HDR_TONEMAP"), "vanilla")) {
                     typed->renodx_flags |= CFG_HDR_RENODX_SCENE;
-                    if (!strcmp(input, "bt709")) typed->renodx_flags |= CFG_HDR_INPUT_BT709;
-                    if (!strcmp(input, "p3")) typed->renodx_flags |= CFG_HDR_INPUT_P3;
                 } else if (cfg_double(PREFIX "HDR_BLOOM") != 50.0 || cfg_double(PREFIX "HDR_LOCAL_EXPOSURE") != 50.0) {
                     typed->renodx_flags |= CFG_HDR_RENODX_EFFECTS;
                 }
@@ -118,7 +115,9 @@ void cfg_render_publish_present(unsigned (*resolve_consumers)(CfgTaa taa, int wa
             typed->projection_revision = old ? old->typed.projection_revision +
                 (old->typed.dlaa != typed->dlaa || strcmp(old->projection_mode, next->projection_mode) ||
                  old->typed.taa != typed->taa || strcmp(old->projection_preset, next->projection_preset) ||
-                 (typed->taa == CFG_TAA_FSR3 && strcmp(old->typed.fsr_version, typed->fsr_version))) : 1;
+                 ((old->typed.consumers ^ consumers) & CFG_RENDER_FSR_FALLBACK) ||
+                 ((typed->taa == CFG_TAA_FSR3 || (consumers & CFG_RENDER_FSR_FALLBACK)) &&
+                  strcmp(old->typed.fsr_version, typed->fsr_version))) : 1;
             __atomic_store_n(&render_index, i, __ATOMIC_SEQ_CST);
             break;
         }
@@ -190,10 +189,10 @@ static const char *const known[] = {
     "DUMP_LOG", "DUMP_RETURN", "EXEFS", "FEEDBACK", "FIX_C0", "FIX_ZERO", "FLIGHT", "FLIGHT_AT", "FLIGHT_DIR", "FLIGHT_FRAMES",
     "FLIGHT_SPIKE_MS", "FLIGHT_THUMB", "FLIGHT_THUMBS", "FLUSH_SPAN", "FLUSH_UPLOAD", "TEX_EVICT", "FOLIAGE_SHADOW_CULL", "FOLIAGE_SHADOW_VRS", "FOV", "FOV_PATCH", "FPS60", "FPS_LIMIT", "FRAMETIMES", "FREEZE_IDLE", "FREEZE_WHOLE", "FREE_CORES",
     "FAST_TEXT", "FULLSCREEN", "FXAA", "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_INDEX", "GPU_NAME", "HDR",
-    "HDR_ADAPTATION_TARGET", "HDR_ADAPTATION_MIN_STOPS", "HDR_ADAPTATION_MAX_STOPS", "HDR_BLOOM", "HDR_BLOWOUT",
-    "HDR_COLOR_SPACE", "HDR_CONTRAST", "HDR_EXPOSURE", "HDR_FLARE", "HDR_GAME_NITS", "HDR_GAMMA", "HDR_GRADE", "HDR_HIGHLIGHT_SAT",
+    "HDR_ADAPTATION_TARGET", "HDR_ADAPTATION_MIN_STOPS", "HDR_ADAPTATION_MAX_STOPS", "HDR_BLOOM",
+    "HDR_CONTRAST", "HDR_EXPOSURE", "HDR_GAME_NITS", "HDR_GAMMA",
     "HDR_HIGHLIGHTS", "HDR_HUE", "HDR_HUE_CLIP", "HDR_LIVE", "HDR_LOCAL_EXPOSURE", "HDR_MATCH_SLOPE", "HDR_MIDGRAY", "HDR_PEAK_NITS",
-    "HDR_SATURATION", "HDR_SHADOWS", "HDR_TONEMAP", "HDR_TONE_SLOPE", "HDR_UI_NITS", "HIGHFPS_FIX",
+    "HDR_SATURATION", "HDR_SHADOWS", "HDR_TONEMAP", "HDR_TONE_SLOPE", "HDR_UI_EOTF", "HDR_UI_NITS", "HIGHFPS_FIX",
     "HUD_LAYOUT", "HUD_HEALTH_X", "HUD_HEALTH_Y", "HUD_HEALTH_SCALE",
     "HUD_BUTTONS_X", "HUD_BUTTONS_Y", "HUD_BUTTONS_SCALE",
     "HUD_MINIMAP_X", "HUD_MINIMAP_Y", "HUD_MINIMAP_SCALE", "HUD_MAX_RATIO", "WIDE_UI_LOG",
@@ -214,11 +213,11 @@ static const char *const known[] = {
 #ifdef GAME_OOT
     "TEXTURE_LOD_STRENGTH",
 #endif
-    "SHOTS_FULL", "MASK_FILTER", "SPEED_PROBE", "SPIN", "SPIN_HANDOFF_US", "TEX_OVER", "FOLD_MAP", "FOLD_SUBMIT_SLOT", "FOLD_SLEEP", "FOLD_AP_SPIN", "AP_SPIN_US", "SUBMIT_PRIO", "PAR_PRIO", "SPLIT_DRAWS", "SPLIT_IN_PASS", "SPLIT_US", "STICK_DEADZONE", "STICK_SENS", "STICK_SENS_PATCH",
+    "SHOTS_FULL", "SPEED_PROBE", "SPIN", "SPIN_HANDOFF_US", "TEX_OVER", "FOLD_MAP", "FOLD_SUBMIT_SLOT", "FOLD_SLEEP", "FOLD_AP_SPIN", "AP_SPIN_US", "SUBMIT_PRIO", "PAR_PRIO", "SPLIT_DRAWS", "SPLIT_IN_PASS", "SPLIT_US", "STICK_DEADZONE", "STICK_SENS", "STICK_SENS_PATCH",
     "SWKBD_ANSWER",
     "FSR_VERSION", "CS_KEEP", "MOVIE_UNET", "MESH_INDICES", "MESH_TASK", "VRAM_BUDGET_MB", "VMA_DUMP", "SNAP_RING_MB", "TEX_EVICT_CLASS", "TPOOL_HIDE", "POOLTAB", "VMA_BLOCK_MB", "TEX_SUBALLOC_KB",
     "SWKBD_TEST", "TEST_PAD", "UPDATE_CHECK", "TEST_PREPARE_SHADERS", "TEST_STALL", "FIXED_SCENE", "FRAMEGEN", "REFLEX", "REFLEX_LOG", "GAME_ASPECT", "GAME_RES", "SCENE_SCALE", "SHADOW_COMPARE", "TAA", "TEX_ALIAS", "TEX_MEMO", "TEX_QUALITY", "TEX_SAME_REG", "DLAA_WARM", "DLAA_SHARPEN", "TPOOL_PUMP_MS", "MOVIE_FPS", "TEX_VRAM_PRESSURE", "TIMER_1MS", "PROCESS_PRIORITY", "RENDER_CORE", "GPU_LOAD_ZERO", "GPU_PASSTIME", "OQLOG", "PRED_ZERO", "RES_GUARD", "TPOOL", "TPOOL_MS", "TPOOL_REGBITS", "PAR_UB_JOIN", "HEAP_CHECK", "EVICT_QUIET", "USNAP_HELD_LOCK", "TPOOL_OLD_MS", "EVICT_HOLD_MS", "PRESSURE_KEEP_USED", "TRACE", "TXD_TRANSPOSE", "UBO_SNAPSHOT", "UPSCALER", "VK_DYN_A2C", "VK_DYN_VERTEX", "VK_NO_FLOAT64",
-    "VK_PRESENT", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOICE_LANG", "VOICE_OPT", "VOLUME", "VRAM_HEADROOM", "VS_OUTS",
+    "VK_PRESENT", "VK_RECORDER", "VK_SSBO_ALIGN", "VK_SUBGROUP", "VK_SUBGROUP_PIN", "VK_VALIDATION", "VOICE_LANG", "VOLUME", "VRAM_HEADROOM", "VS_OUTS",
     "WALK_KEY", "WALK_SCALE", "STICK_DASH", "DASH_KEY", "WB_EXACT", "WB_FENCE_LIMIT", "WB_MERGE", "WINDOW_SIZE", "XLATE", "XLATE_ID", "XLATE_KEEP", "XLATE_PROCS",
     "ZSTD_CHECK", "ZSTD_NATIVE",
 };
@@ -233,11 +232,11 @@ static const struct { const char *key, *section; } sections[] = {
     {"COLOR_PRESET", "display"},
     {"COLOR_BRIGHTNESS", "display"}, {"COLOR_CONTRAST", "display"}, {"COLOR_SATURATION", "display"},
     {"COLOR_GAMMA", "display"}, {"HDR", "display"}, {"HDR_LIVE", "display"}, {"HDR_PEAK_NITS", "display"},
-    {"HDR_GAME_NITS", "display"}, {"HDR_UI_NITS", "display"}, {"HDR_GAMMA", "display"}, {"HDR_COLOR_SPACE", "display"}, {"HDR_TONEMAP", "display"},
+    {"HDR_GAME_NITS", "display"}, {"HDR_UI_NITS", "display"}, {"HDR_GAMMA", "display"}, {"HDR_UI_EOTF", "display"},
+    {"HDR_TONEMAP", "display"}, {"SDR_TONEMAP", "display"},
     {"HDR_MIDGRAY", "display"}, {"HDR_MATCH_SLOPE", "display"}, {"HDR_TONE_SLOPE", "display"}, {"HDR_HUE_CLIP", "display"},
     {"HDR_EXPOSURE", "display"}, {"HDR_HIGHLIGHTS", "display"}, {"HDR_SHADOWS", "display"}, {"HDR_CONTRAST", "display"},
-    {"HDR_SATURATION", "display"}, {"HDR_HIGHLIGHT_SAT", "display"}, {"HDR_BLOWOUT", "display"}, {"HDR_FLARE", "display"},
-    {"HDR_HUE", "display"}, {"HDR_GRADE", "display"}, {"HDR_BLOOM", "display"}, {"SHADOW_RES", "display"},
+    {"HDR_SATURATION", "display"}, {"HDR_HUE", "display"}, {"HDR_BLOOM", "display"}, {"SHADOW_RES", "display"},
     {"HDR_LOCAL_EXPOSURE", "display"},
     {"HDR_ADAPTATION_TARGET", "display"}, {"HDR_ADAPTATION_MIN_STOPS", "display"}, {"HDR_ADAPTATION_MAX_STOPS", "display"},
     {"DLAA", "display"}, {"DLSS", "display"}, {"DLSS_PRESET", "display"}, {"FSR_VERSION", "display"}, {"FXAA", "display"},
@@ -293,11 +292,17 @@ static const CfgMeta metas[] = {
 #else
     {"OUTPUT_RES", "1920x1080", NULL, RESTART}, {"RENDER_SCALE", "game", "game|50|67|75|100|125|150|200", RESTART},
 #endif
-    {"UPSCALER", "fsr", "fsr|bilinear", LIVE}, {"SHARPNESS", "80", "0..100", LIVE},
+    {"UPSCALER", "fsr", "fsr|bilinear", LIVE},
+    {"SHARPNESS", "80", "0..100", LIVE},
 #ifdef GAME_OOT
     {"TEXTURE_LOD_STRENGTH", "100", "0..100", LIVE},
 #endif
-    {"DLAA", "0", "0|1", RESTART}, {"DLSS", "dlaa", "dlaa|quality|balanced|performance|ultra_performance", LIVE},
+#ifdef GAME_OOT
+    {"DLAA", "0", "0|1", LIVE},
+#else
+    {"DLAA", "0", "0|1", RESTART},
+#endif
+    {"DLSS", "dlaa", "dlaa|quality|balanced|performance|ultra_performance", LIVE},
     {"DLSS_PRESET", "default", "default|k|m|l|j|e", LIVE},   // vk_dlaa.c preset_value
     {"FSR_VERSION", "auto", "auto|4|3", LIVE},               // vk_ffx.cpp fsr_version
     {"FXAA", "1", "0|1", LIVE},
@@ -310,22 +315,21 @@ static const CfgMeta metas[] = {
     {"COLOR_PRESET", "default", "default|vivid|clarity|custom", LIVE}, {"COLOR_BRIGHTNESS", "0", "-30..30", LIVE},
     {"COLOR_CONTRAST", "100", "70..150", LIVE}, {"COLOR_SATURATION", "100", "50..200", LIVE},
     {"COLOR_GAMMA", "1", "0.8..1.2", LIVE},
-    // HDR output (vk_hdr.c): OoT switches 0/1 live when HDR_LIVE=1 (native waits for a restart); grading and nits live
+    // OoT switches SDR/HDR live; the HDR tonemapper selects the compositor format.
 #ifdef GAME_OOT
-    {"HDR", "0", "0|1|native", LIVE}, {"HDR_LIVE", "1", "0|1", RESTART},
+    {"HDR", "0", "0|1", LIVE},
     {"HDR_PEAK_NITS", "1000", "400..10000", LIVE}, {"HDR_GAME_NITS", "203", "48..500", LIVE},
-    {"HDR_UI_NITS", "203", "48..500", LIVE}, {"HDR_GAMMA", "2.2", "off|2.2|2.4", LIVE},
-    {"HDR_COLOR_SPACE", "bt709", "bt709|p3", LIVE},   // vk_hdr.c nits, shaders/hdr_encode.comp
-    {"HDR_TONEMAP", "psychov35", "psychov35|renodrt|vanilla", LIVE},
+    {"HDR_UI_NITS", "203", "48..500", LIVE}, {"HDR_GAMMA", "off", "off|2.2|2.4", LIVE},
+    {"HDR_UI_EOTF", "2.2", "off|2.2|2.4", LIVE},
+    {"HDR_TONEMAP", "psychov35", "psychov35|vanilla", LIVE},
+    {"SDR_TONEMAP", "vanilla", "psychov35|vanilla", LIVE},
     {"HDR_MIDGRAY", "vanilla", "vanilla|render|adaptation", LIVE}, {"HDR_MATCH_SLOPE", "1", "0|1", LIVE},
     {"HDR_ADAPTATION_TARGET", "18", "1..100", LIVE},
     {"HDR_ADAPTATION_MIN_STOPS", "-4", "-8..0", LIVE}, {"HDR_ADAPTATION_MAX_STOPS", "2", "0..8", LIVE},
     {"HDR_TONE_SLOPE", "50", "0..100", LIVE}, {"HDR_HUE_CLIP", "50", "0..100", LIVE},
     {"HDR_EXPOSURE", "100", "0..800", LIVE}, {"HDR_HIGHLIGHTS", "50", "0..100", LIVE},
     {"HDR_SHADOWS", "50", "0..100", LIVE}, {"HDR_CONTRAST", "50", "0..100", LIVE},
-    {"HDR_SATURATION", "50", "0..100", LIVE}, {"HDR_HIGHLIGHT_SAT", "50", "0..100", LIVE},
-    {"HDR_BLOWOUT", "0", "0..100", LIVE}, {"HDR_FLARE", "0", "0..100", LIVE},
-    {"HDR_HUE", "100", "0..100", LIVE}, {"HDR_GRADE", "100", "0..100", LIVE},
+    {"HDR_SATURATION", "50", "0..100", LIVE},
     {"HDR_BLOOM", "50", "0..100", LIVE},   // vk_hdr.c tonemap_splice: the game's bloom term times value / 50
     {"HDR_LOCAL_EXPOSURE", "50", "0..100", LIVE},   // vk_hdr.c tonemap_splice: local exposure correction in stops
 #else
@@ -436,7 +440,12 @@ static const CfgMeta metas[] = {
     {"ZSTD_NATIVE", "1", "0|1", RESTART}, {"ZSTD_CHECK", "0", "0|1", RESTART},
     // render fixes
     {"LOD_GUARD", "1", "0|1", RESTART}, {"FIX_C0", "1", "0|1", RESTART}, {"FIX_ZERO", "1", "0|1", RESTART},
-    {"TAA", "dlss", "dlss|fsr3|fsr1", RESTART}, {"GAME_ASPECT", "16:9", "16:9|window|21:9|32:9", RESTART}, {"GAME_RES", "1440", "720|900|1080|1440|1800|2160|2880|window", RESTART},
+#ifdef GAME_OOT
+    {"TAA", "dlss", "dlss|fsr3|fsr1|bilinear", LIVE},
+#else
+    {"TAA", "dlss", "dlss|fsr3|fsr1", RESTART},
+#endif
+    {"GAME_ASPECT", "16:9", "16:9|window|21:9|32:9", RESTART}, {"GAME_RES", "1440", "720|900|1080|1440|1800|2160|2880|window", RESTART},
     {"HUD_LAYOUT", "edges", "edges|center|custom", LIVE},
     {"HUD_HEALTH_X", "0", "-15..15", LIVE}, {"HUD_HEALTH_Y", "0", "-15..15", LIVE}, {"HUD_HEALTH_SCALE", "100", "75..125", LIVE},
     {"HUD_BUTTONS_X", "0", "-15..15", LIVE}, {"HUD_BUTTONS_Y", "0", "-15..15", LIVE}, {"HUD_BUTTONS_SCALE", "100", "75..125", LIVE},
@@ -458,10 +467,17 @@ static const CfgMeta metas[] = {
     {"WB_FENCE_LIMIT", "65536", "0..1073741824", RESTART}, {"WB_MERGE", "1", "0|1", RESTART}, {"WB_EXACT", "1", "0|1", RESTART},
     {"PASS_CRUMBS", "", "0|1", RESTART},   // vk_crumbs.c pass marks; unset: VK_AMD_buffer_marker only
     {"INPUT_RECORD", "", NULL, RESTART},
-    {"MOTION_VECTORS", "hybrid", "hybrid|camera|models|off", LIVE},   // vk_dlaa.c motion_settings_check
+    {"MOTION_VECTORS", "hybrid", "hybrid|camera|models|off", LIVE},
     {"DLAA_REVERSE_ONLY", "0", "0|1", LIVE},
     {"DLAA_PRE_BLOOM", "0", "0|1", RESTART},   // vk_dlaa.c vk_dlaa_init
+#ifdef GAME_OOT
+    {"DLSS_PREBLOOM", "1", "0|1", RESTART},   // patches.c: checked reconstruction before the guest bloom
+#endif
+#ifdef GAME_OOT
+    {"DLSS_INTERFACE_RECOMPOSITION", "1", "0|1", RESTART},
+#else
     {"DLSS_INTERFACE_RECOMPOSITION", "0", "0|1", RESTART},
+#endif
 };
 
 static int is_known(const char *key) {
@@ -532,6 +548,26 @@ static void add(char *key, char *value, int line) {
 // Read as those two, which the menu shows and the next cfg_save writes; a prompts line of the file's own wins. The
 // value still works from the environment (input_pad_layout_pick, input_prompts_pick).
 static void migrate(void) {
+#ifdef GAME_OOT
+    CfgEntry *hdr = NULL, *mapper = NULL;
+    for (int i = 0; i < n_entries; ++i) {
+        if (!strcmp(entries[i].key, "HDR")) hdr = &entries[i];
+        if (!strcmp(entries[i].key, "HDR_TONEMAP")) mapper = &entries[i];
+    }
+    if (hdr && !strcmp(hdr->value, "native") && (mapper || n_entries < CFG_MAX_KEYS)) {
+        free(hdr->value);
+        hdr->value = strdup("1");
+        hdr->dirty = 1;
+        if (mapper) {
+            free(mapper->value);
+            mapper->value = strdup("vanilla");
+            mapper->dirty = 1;
+        } else {
+            entries[n_entries++] = (CfgEntry){strdup("HDR_TONEMAP"), strdup("vanilla"), 1, 0};
+        }
+        rt_log("cfg: " RT_INI_FILE " hdr = native is read as hdr = 1 and hdr_tonemap = vanilla");
+    }
+#endif
     CfgEntry *layout = NULL, *prompts = NULL;
     for (int i = 0; i < n_entries; i++) {
         if (!strcmp(entries[i].key, "PAD_LAYOUT")) layout = &entries[i];
@@ -812,6 +848,18 @@ const CfgMeta *cfg_meta_at(int i) { return i >= 0 && (size_t)i < sizeof metas / 
 
 const char *cfg_value(const char *name) {
     const char *e = cfg_get(name);
+#ifdef GAME_OOT
+    const char *key = key_of(name);
+    if (key && !strcasecmp(key, "HDR") && e && !strcmp(e, "native")) return "1";
+    if (key && !strcasecmp(key, "HDR_TONEMAP")) {
+        const char *signal = raw_get(PREFIX "HDR");
+        if (signal && !strcmp(signal, "native")) return "vanilla";
+    }
+    if (e && !strcmp(e, "renodrt")) {
+        if (key && (!strcasecmp(key, "HDR_TONEMAP") || !strcasecmp(key, "SDR_TONEMAP")))
+            return cfg_meta(name)->def;   // Retired mapper: migrate saved settings and environment overrides alike.
+    }
+#endif
     if (e && *e) return e;
     const CfgMeta *m = cfg_meta(name);
     if (!m) rt_fatal("cfg: %s has no row in the settings table", name);
@@ -1113,6 +1161,7 @@ static void load_ini(void) {
 
 void cfg_init(void) {
     load_ini();
+#ifndef GAME_OOT
     // Frame generation takes DLSS / DLAA's depth and motion vectors (vk_dlaa.c): asked for from the base mode (a
     // rekarina.ini line, the setup), it switches dlaa on in the settings themselves, so every part that reads dlaa
     // (the scene's size, the upscaling pass, the motion vectors) agrees. dlaa set to 0 in the environment wins: the
@@ -1122,6 +1171,7 @@ void cfg_init(void) {
         cfg_set(PREFIX "DLAA", "1");
         rt_log("cfg: framegen = %s turns dlaa on: frame generation takes its depth and motion vectors", fg);
     }
+#endif
     snapshot_restart_values();
     if (profile_of())
         rt_log("cfg: device profile %s: defaults for the keys " RT_INI_FILE " does not set (REKARINA_DEVICE_PROFILE=desktop "

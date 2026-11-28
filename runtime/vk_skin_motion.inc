@@ -87,16 +87,6 @@ static struct {
     uint64_t seen, own, guarded, why[SKIN_WHYS];
 } SK;
 
-static int skin_enabled(void) {
-#ifdef GAME_OOT
-    static int on = -1;
-    if (on < 0) on = cfg_bool("REKARINA_SKIN_MOTION");
-    return on;
-#else
-    return 0;
-#endif
-}
-
 static void skin_left(int why) { __atomic_add_fetch(&SK.why[why], 1, __ATOMIC_RELAXED); }
 
 // A hash set of SKIN_SLOTS words (0: empty). skin_has: whether v is in it; skin_put: adds it.
@@ -135,7 +125,6 @@ static int skin_tracked_palette(const VkExec *ex, int bank, unsigned stride) {
 // filter). Reads the draw's own state only: the chunks of a parallel group ask at once.
 static int skin_pick(VkExec *ex, const TrackedModelSample *work_model, SkinPick *out) {
     out->stride = 0;
-    if (!skin_enabled() || !(vk_dlaa_active() || vk_dlaa_fg_only())) return 0;
     int slot, storage;
     uint32_t joints, raw_joints;
     int stride = gfx_shader_palette(B.st.vs, &slot, &storage, &joints, &raw_joints);
@@ -179,7 +168,6 @@ static int skin_pick_left(const SkinPick *s, int why) {
 static void skin_begin(uint64_t frame) {
     SK.why[SKIN_UNUSED] += SK.pending;
     SK.pending = 0, SK.resolved = 0;
-    if (!skin_enabled()) return;
     SkinFrame *f = &SK.f[SK.cur];
     f->frame = frame, f->scene_depth = VK_NULL_HANDLE;
     f->n = f->ne = f->nb = f->nseen = 0, f->used = 0;
@@ -371,7 +359,7 @@ static void skin_resolve(VkExec *ex, uint64_t frame, uint64_t cam, VkImage depth
     SkinFrame *f = &SK.f[SK.cur];
     const SkinFrame *last = &SK.f[SK.cur ^ 1];
     // only the list of this submission: its blocks' scratch memory lives as long as the submission
-    if (!skin_enabled() || SK.resolved || MQ.frame != frame || MQ.fence != ex->fence || f->frame != frame) return;
+    if (SK.resolved || MQ.frame != frame || MQ.fence != ex->fence || f->frame != frame) return;
     SK.resolved = 1;
     f->scene_depth = depth;
     int ne = 0;
@@ -454,7 +442,6 @@ static void skin_recorded(int guarded) {
 // ones drawn with their own motion, and the others by why they kept the camera's.
 static int skin_status(char *out, size_t cap) {
     out[0] = 0;
-    if (!skin_enabled()) return 0;
     const uint64_t *y = SK.why;
     return snprintf(out, cap, "skinned draws seen %llu, drawn with their own motion %llu (checked against last frame's "
                     "depth %llu), left to the camera: carried by another draw of the mesh %llu, not drawn last frame %llu, "

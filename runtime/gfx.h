@@ -106,9 +106,18 @@ const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words);
 const GfxShader *gfx_shader_own(const uint32_t *spirv, uint64_t words, const char *res_json);
 // vk_hdr.c: when the HDR path is armed, splices (OoT) or replaces (TotK) the game's tonemap fragment shader SPIR-V
 // (malloc'd, *words long) and removes output clamps in its FSR pass; gfx_shader.c calls it as fragment shaders load.
-int vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words);   // returns the added meter binding, or 0
 #ifdef GAME_OOT
+typedef enum { GFX_RENODX_HDR, GFX_RENODX_EFFECTS, GFX_RENODX_SDR, GFX_RENODX_GRADE } GfxRenodxVariant;
+const GfxShader *gfx_shader_renodx_variant(const GfxShader *s, GfxRenodxVariant variant);
 int gfx_shader_guest_pq(const GfxShader *s);
+int vk_hdr_scene_splice(uint32_t **spirv, uint64_t *words, GfxRenodxVariant variant, int *meter_binding);
+enum { GFX_HDR_AA_PREP, GFX_HDR_AA_BLEND, GFX_HDR_AA_STORE, GFX_HDR_AA_ROLES };
+const GfxShader *gfx_shader_renodx_aa(const GfxShader *s, unsigned role);
+int vk_hdr_aa_splice(uint32_t **spirv, uint64_t *words, unsigned binding, unsigned expected, int store);
+int vk_aa_mask_splice(uint32_t **spirv, uint64_t *words, unsigned binding);
+const GfxShader *gfx_shader_aa_mask(const GfxShader *shader);
+#else
+int vk_hdr_shader_swap(uint32_t **spirv, uint64_t *words);
 #endif
 uint64_t gfx_shader_failures(void);                         // failed translations; feeds GfxStats.shader_failures
 // Reflection: parsed once per shader from the translator's .res.json and the SPIR-V before it enters the cache.

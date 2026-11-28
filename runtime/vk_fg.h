@@ -23,7 +23,7 @@ int vk_fg_instead(void);
 // 1 when AMD FSR frame generation can run here (its libraries are beside the game), else 0 with *why (the menu's row)
 int vk_fg_offered(const char **why);
 int vk_fg_generating(void);                  // ... and the last frame had generation on (not paused for the menu)
-const char *vk_fg_method(void);              // interpolation provider label, called under the presentation lock
+const char *vk_fg_method(void);              // interpolation context's provider, read under the presentation lock
 // gfx_present.c's swapchain calls while vk_fg_wanted: the first create makes AMD's swapchain context and swapchain,
 // later ones (window resizes, the fullscreen switch) its swapchain again, in place with FSR SDK 2. Non-success from the
 // first: the plain swapchain path stays; after vk_fg_failed: the caller releases AMD's and makes a plain one.

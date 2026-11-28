@@ -318,7 +318,7 @@ static void guest_pq_case(VkCtx *c, const Img *sdr, const Img *hdr) {
 int probe_color(void) {
     static const char *const vars[] = {"COLOR_BRIGHTNESS", "COLOR_CONTRAST", "COLOR_SATURATION",
                                        "COLOR_GAMMA", "HDR_GAME_NITS", "HDR_UI_NITS", "HDR_PEAK_NITS",
-                                       "HDR_GAMMA", "HDR_COLOR_SPACE", "HDR", "HDR_EXPOSURE"};
+                                       "HDR_GAMMA", "HDR", "HDR_EXPOSURE"};
     for (size_t i = 0; i < sizeof vars / sizeof *vars; i++) {
         char modern[64], legacy[64];
         snprintf(modern, sizeof modern, "REKARINA_%s", vars[i]);
@@ -328,7 +328,6 @@ int probe_color(void) {
     }
     cfg_set("REKARINA_HDR", "0");
 #ifdef GAME_OOT
-    cfg_set("REKARINA_HDR_COLOR_SPACE", "bt709");
     static const struct { const char *percent; float gain; } exposure[] = {
         {"0", 0.0f}, {"12.5", 0.125f}, {"100", 1.0f}, {"200", 2.0f}, {"800", 8.0f},
     };

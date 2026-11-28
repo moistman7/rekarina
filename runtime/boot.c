@@ -470,6 +470,7 @@ void rt_boot_process_priority(int level) { boot_process_priority = level; }
 
 void rt_boot(void) {
     check_npdm();
+    romfs_open_image();
     renderer_mcp_start();
     if (!rt_config()->shot) vk_pipeline_async_enable();   // a --shot image must not depend on build timing
     // Shaders and pipelines recorded in earlier runs are made ready while the modules load; the guest waits for them.

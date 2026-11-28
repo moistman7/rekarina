@@ -733,6 +733,7 @@ static int create_device(void) {
     }
     const VkPhysicalDeviceFeatures *h = &c->f2.features;
     g_vk.has_fragment_stores = h->fragmentStoresAndAtomics;
+    g_vk.has_extended_storage_formats = h->shaderStorageImageExtendedFormats;
     const char *miss = NULL;
     if (!c->f12.timelineSemaphore) miss = "timelineSemaphore";
     else if (!c->f13.dynamicRendering) miss = "dynamicRendering";

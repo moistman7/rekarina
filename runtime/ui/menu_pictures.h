@@ -14,6 +14,10 @@
 
 enum MenuPicture { PIC_NONE, PIC_PIPELINE, PIC_PAD, PIC_PERF, PIC_SYSTEM, PIC_KEYS };
 
+#ifdef GAME_OOT
+bool menu_fsr4_selected();
+#endif
+
 // The picture for the row of setting key (REKARINA_ name or row id, opt_desc_key), PIC_NONE for none.
 MenuPicture menu_picture_for(const char *key);
 // Draws it; key is the row described (the pipeline marks the stage that row sets), scale the menu's (1 at 1080 lines).

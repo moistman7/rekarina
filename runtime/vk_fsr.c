@@ -162,14 +162,23 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
                   VkImage dst, const int out[4]) {
     int cw = crop[2], ch = crop[3];
     uint32_t dw = (uint32_t)out[2], dh = (uint32_t)out[3];
-    int rcas_only = dw == (uint32_t)cw && dh == (uint32_t)ch && !crop[0] && !crop[1] && vk_dlaa_sharpens() && cfg_int("REKARINA_SHARPNESS") > 0;
+#ifdef GAME_OOT
+    const int sharp = 0;   // the finished picture includes the HUD
+    const int rcas_only = 0;
+#else
+    const CfgRenderValues *settings = cfg_render_values();
+    int sharp = settings ? settings->sharpness : cfg_int("REKARINA_SHARPNESS");
+    if (sharp < 0) sharp = 0;
+    if (sharp > 100) sharp = 100;
+    int rcas_only = dw == (uint32_t)cw && dh == (uint32_t)ch && !crop[0] && !crop[1] && vk_dlaa_sharpens() && sharp > 0;
+#endif
     {   // DEBUG-RCASWHY
         static int n;
         static uint64_t f;
         f++;
         if (f > 1500 && n < 3) n++, rt_log("RCASWHY frame %llu: dst %ux%u crop %d,%d %dx%d src %dx%d fmt %d sharpens %d sharpness %d upscaler %s",
                                            (unsigned long long)f, dw, dh, crop[0], crop[1], cw, ch, sw, sh, (int)fmt, vk_dlaa_sharpens(),
-                                           cfg_int("REKARINA_SHARPNESS"), cfg_value("REKARINA_UPSCALER"));
+                                           sharp, cfg_value("REKARINA_UPSCALER"));
     }
     if (strcmp(cfg_value("REKARINA_UPSCALER"), "fsr") || ((dw <= (uint32_t)cw && dh <= (uint32_t)ch) && !rcas_only) || !fmt) return 0;
     VkCtx *c = vk_ctx();
@@ -186,9 +195,6 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
         F.src_view[slot] = VK_NULL_HANDLE;
         return 0;
     }
-    int sharp = cfg_int("REKARINA_SHARPNESS");
-    if (sharp < 0) sharp = 0;
-    if (sharp > 100) sharp = 100;
     if (!F.logged && (dw != (uint32_t)cw || dh != (uint32_t)ch)) {
         F.logged = 1;
         rt_log("vk: FSR upscales %dx%d to %ux%u (sharpness %d)", cw, ch, dw, dh, sharp);
@@ -243,14 +249,8 @@ int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, 
     return 1;
 }
 
-// ---- FSR 1 on the 3D scene (REKARINA_TAA = fsr1; vk_dlaa.c evaluate): the scene drawn smaller (the DLSS mode's share),
-// scaled to the game's picture in place of the game's own scaling dispatch, as DLSS and FSR 3.1 are. Spatial: no
-// motion vectors, no jitter, no history, so it costs the same on every card and shows nothing a temporal upscaler can
-// smear. Four compute passes on the replay's command buffer: the encode (tools/make_fsr_scene.py) maps the light
-// target's linear light into 0..1 at the scene size, EASU scales it to the picture's size, RCAS sharpens it at the
-// sharpness setting (none at 0), the decode turns it back into linear light in the caller's RGBA16F image, which the
-// caller then blits into the game's target. Its own layout and pipelines: this runs on the replay thread, the present's
-// FSR above on the present thread.
+// Scene FSR1 runs on the replay thread, separately from display scaling. OoT filters tone-mapped color in signed
+// square-root space; TotK keeps its reversible encode of scene light (tools/make_fsr_scene.py).
 #include "fsr_scene_spv.h"
 
 static struct {
@@ -258,9 +258,10 @@ static struct {
     PFN_vkCmdPushDescriptorSetKHR push;
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
+    int easu_tried, rcas_tried;
     VkPipeline enc, easu, rcas, dec;
     VkSampler sampler;
-    VkImage img[2];                // the encoded scene (scene size), EASU's picture before RCAS (picture size)
+    VkImage img[2];                // EASU's encoded input and shared output scratch
     VmaAllocation alloc[2];
     VkImageView view[2];
     uint32_t w[2], h[2];
@@ -305,12 +306,8 @@ static int scene_init(VkCtx *c) {
                               .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0};
     if (vkCreateDescriptorSetLayout(c->device, &dci, NULL, &S.dsl) != VK_SUCCESS ||
         vkCreatePipelineLayout(c->device, &li, NULL, &S.layout) != VK_SUCCESS ||
-        vkCreateSampler(c->device, &si, NULL, &S.sampler) != VK_SUCCESS ||
-        !(S.enc = scene_pipeline(c, fsr_scene_encode_spv, sizeof fsr_scene_encode_spv)) ||
-        !(S.easu = scene_pipeline(c, fsr_easu_spv, sizeof fsr_easu_spv)) ||
-        !(S.rcas = scene_pipeline(c, fsr_rcas_spv, sizeof fsr_rcas_spv)) ||
-        !(S.dec = scene_pipeline(c, fsr_scene_decode_spv, sizeof fsr_scene_decode_spv))) {
-        rt_log("vk: FSR 1 on the scene off: its pipelines could not be created");
+        vkCreateSampler(c->device, &si, NULL, &S.sampler) != VK_SUCCESS) {
+        rt_log("vk: scene filters off: shared descriptors or sampler could not be created");
         return 0;
     }
     return S.ok = 1;
@@ -322,20 +319,21 @@ static void scene_free(VkCtx *c, int i) {
     S.view[i] = VK_NULL_HANDLE, S.img[i] = VK_NULL_HANDLE, S.w[i] = S.h[i] = 0;
 }
 
-// Work image i (0 the encoded scene, 1 EASU's picture) at w x h, in GENERAL. Another size waits for the device first:
-// earlier frames may still read the old one (the scene's size changes with the DLSS mode or the window, rarely).
+// Keep the previous image alive through commands already recorded at its size.
 static int scene_image(VkCtx *c, VkCommandBuffer cb, int i, uint32_t w, uint32_t h) {
     if (S.img[i] && S.w[i] == w && S.h[i] == h) return 1;
     if (S.img[i]) {
-        vk_queue_lock();
-        vkDeviceWaitIdle(c->device);
-        vk_queue_unlock();
-        scene_free(c, i);
+        vk_defer_view(S.view[i]);
+        vk_defer_image(S.img[i], S.alloc[i]);
+        S.view[i] = VK_NULL_HANDLE;
+        S.img[i] = VK_NULL_HANDLE;
+        S.w[i] = S.h[i] = 0;
     }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
                             .format = VK_FORMAT_R16G16B16A16_SFLOAT, .extent = {w, h, 1}, .mipLevels = 1,
                             .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+                            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                     (i ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0)};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateImage(c->vma, &ci, &ai, &S.img[i], &S.alloc[i], NULL) != VK_SUCCESS) {
         S.img[i] = VK_NULL_HANDLE;
@@ -378,16 +376,35 @@ static void compute_after_compute(VkCommandBuffer cb) {
     vkCmdPipelineBarrier2(cb, &d);
 }
 
+#ifdef GAME_OOT
+static int vk_fsr_scene(VkCommandBuffer cb, VkImageView src, uint32_t w, uint32_t h, VkImageView out, uint32_t ow, uint32_t oh,
+                        int hdr_bt2020) {
+#else
 int vk_fsr_scene(VkCommandBuffer cb, VkImageView src, uint32_t w, uint32_t h, VkImageView out, uint32_t ow, uint32_t oh) {
+    const int hdr_bt2020 = 0;
+#endif
     VkCtx *c = vk_ctx();
     if (!S.tried) scene_init(c);
     if (!S.ok || !w || !h || !ow || !oh) return 0;
+    if (!S.easu_tried) {
+        S.easu_tried = 1;
+        S.enc = scene_pipeline(c, fsr_scene_encode_spv, sizeof fsr_scene_encode_spv);
+        S.easu = scene_pipeline(c, fsr_easu_spv, sizeof fsr_easu_spv);
+        S.dec = scene_pipeline(c, fsr_scene_decode_spv, sizeof fsr_scene_decode_spv);
+    }
+    if (!S.enc || !S.easu || !S.dec) return 0;
+#ifndef GAME_OOT
     int sharp = cfg_int("REKARINA_SHARPNESS");
     if (sharp < 0) sharp = 0;
     if (sharp > 100) sharp = 100;
-    if (!scene_image(c, cb, 0, w, h) || (sharp > 0 && !scene_image(c, cb, 1, ow, oh))) return 0;
+    if (sharp && !S.rcas) S.rcas = scene_pipeline(c, fsr_rcas_spv, sizeof fsr_rcas_spv);
+    if (sharp && (!S.rcas || !scene_image(c, cb, 1, ow, oh))) return 0;
+#else
+    const int sharp = 0;
+#endif
+    if (!scene_image(c, cb, 0, w, h)) return 0;
     // the caller ordered the scene's draws before this and earlier frames' reads of these images (a full barrier)
-    float enc[8] = {(float)w, (float)h, 0, 0, 0, 0, 0, 0};
+    float enc[8] = {(float)w, (float)h, (float)hdr_bt2020};
     scene_pass(cb, S.enc, src, S.view[0], enc);
     vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
     compute_after_compute(cb);
@@ -401,13 +418,59 @@ int vk_fsr_scene(VkCommandBuffer cb, VkImageView src, uint32_t w, uint32_t h, Vk
         vkCmdDispatch(cb, (ow + 15) / 16, (oh + 15) / 16, 1);
         compute_after_compute(cb);
     }
-    float dec[8] = {(float)ow, (float)oh, 0, 0, 0, 0, 0, 0};
+    float dec[8] = {(float)ow, (float)oh, (float)hdr_bt2020};
     scene_pass(cb, S.dec, VK_NULL_HANDLE, out, dec);
     vkCmdDispatch(cb, (ow + 7) / 8, (oh + 7) / 8, 1);
+#ifndef GAME_OOT
     static int told;
     if (!told++) rt_log("vk: FSR 1 scales the scene %ux%u to %ux%u (sharpness %d)", w, h, ow, oh, sharp);
+#endif
     return 1;
 }
+
+#ifdef GAME_OOT
+static int scene_output_supported(VkCtx *c, VkFormat format) {
+    VkFormatProperties dst, scratch;
+    vkGetPhysicalDeviceFormatProperties(c->phys, format, &dst);
+    vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_R16G16B16A16_SFLOAT, &scratch);
+    return (dst.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) &&
+           (scratch.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT);
+}
+
+static void scene_output(VkCommandBuffer cb, VkImage dst, uint32_t w, uint32_t h) {
+    barrier(cb, S.img[1], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}, .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+    vkCmdBlitImage(cb, S.img[1], VK_IMAGE_LAYOUT_GENERAL, dst, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+}
+
+int vk_fsr_tonemapped(VkCommandBuffer cb, VkImageView src, uint32_t w, uint32_t h, VkImage dst, VkFormat format,
+                      uint32_t ow, uint32_t oh, int hdr_bt2020) {
+    VkCtx *c = vk_ctx();
+    if (hdr_bt2020 && format != VK_FORMAT_R16G16B16A16_SFLOAT) return 0;
+    if (!src || !scene_output_supported(c, format) || !scene_image(c, cb, 1, ow, oh) ||
+        !vk_fsr_scene(cb, src, w, h, S.view[1], ow, oh, hdr_bt2020)) return 0;
+    scene_output(cb, dst, ow, oh);
+    return 1;
+}
+
+int vk_scene_rcas(VkCommandBuffer cb, VkImage image, VkImageView view, VkFormat format, uint32_t w, uint32_t h, int strength) {
+    VkCtx *c = vk_ctx();
+    if (!S.tried) scene_init(c);
+    if (!S.ok) return 0;
+    if (!S.rcas_tried) {
+        S.rcas_tried = 1;
+        S.rcas = scene_pipeline(c, fsr_rcas_spv, sizeof fsr_rcas_spv);
+    }
+    if (!S.rcas || !scene_output_supported(c, format) || !scene_image(c, cb, 1, w, h)) return 0;
+    float pc[8] = {(float)w, (float)h, (float)(100 - strength) / 50.0f, vk_hdr_renodx_scene() ? 2.0f : 1.0f};
+    scene_pass(cb, S.rcas, view, S.view[1], pc);
+    vkCmdDispatch(cb, (w + 15) / 16, (h + 15) / 16, 1);
+    scene_output(cb, image, w, h);
+    return 1;
+}
+#endif
 
 void vk_fsr_release(void) {
     VkCtx *c = vk_ctx();

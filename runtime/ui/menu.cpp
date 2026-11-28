@@ -67,21 +67,23 @@ extern const char rt_port_version[];
 void cheats_frame(uint64_t frame);   // cheats.c
 bool tab_cheats(float scale);        // ui/cheats_tab.cpp; true: restart into the rebuild
 const char *vk_dlssg_off_why(void);  // vk_dlssg.c: why DLSS Frame Generation asked at start is not running
-int vk_dlssg_swapchain_ready(void);  // vk_dlssg.c: Streamline owns the swapchain (DLSS-G toggles live)
 int vk_dlssg_active(void);           // vk_dlssg.c: DLSS Frame Generation is actively generating frames
 int vk_reflex_offered(void);         // vk_reflex.c: native VK_NV_low_latency2 or Streamline Reflex available
 const char *vk_fg_off_why(void);     // vk_fg.cpp: the same for AMD FSR frame generation
 int vk_dlssg_offered(const char **why);   // vk_dlssg.c: DLSS Frame Generation can run here
 int vk_fg_offered(const char **why);      // vk_fg.cpp: AMD FSR frame generation can run here
 int vk_fg_instead(void);                  // vk_fg.cpp: AMD's runs in place of DLSS's
-int vk_fg_active(void);
 #ifdef GAME_OOT
 int vk_fg_restart_needed(void);
 #endif
+int vk_fg_active(void);
 int vk_hdr_wanted(void);                  // vk_hdr.c: HDR requested / active / native / restart state
+int vk_dlaa_backend_available(void);
+int vk_dlaa_available(void);
+int vk_dlaa_fsr1(void);
+int vk_dlaa_fsr3(void);
+double res_fixed_scene_share(void);
 int vk_hdr_active(void);
-int vk_hdr_native(void);
-int vk_hdr_needs_restart(void);
 int vk_hdr_adaptation_supported(void);
 int rt_patch_set(const char *name);       // host.h: index of a set of the generated patches.h, -1 if absent
 }
@@ -331,14 +333,7 @@ static void make_context(void) {
     g_ctx_ok = 1;
 }
 
-static VkPipeline g_coverage_pipeline;
-static VkDevice g_coverage_device;
-
 static void vk_down(void) {
-    if (g_coverage_pipeline) {
-        vkDestroyPipeline(g_coverage_device, g_coverage_pipeline, nullptr);
-        g_coverage_pipeline = VK_NULL_HANDLE;
-    }
     if (!g_vk_ok) return;
     ImGui_ImplVulkan_Shutdown();
     g_vk_ok = 0;
@@ -357,12 +352,12 @@ static int vk_up(const MenuTarget *t) {
     ii.ApiVersion = VK_API_VERSION_1_3;
     ii.Instance = t->instance;
     ii.PhysicalDevice = t->phys;
-    ii.Device = g_coverage_device = t->device;
+    ii.Device = t->device;
     ii.QueueFamily = t->queue_family;
     ii.Queue = t->queue;
     ii.DescriptorPoolSize = 16;
     ii.MinImageCount = 2;
-    ii.ImageCount = 4;   // vertex buffers rotate per recorded frame: more than gfx_present.c's 2 frames in flight
+    ii.ImageCount = 4;   // two frames in flight, up to two draws into separate targets per frame
     ii.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     ii.UseDynamicRendering = true;
     g_vk_fmt = t->format;
@@ -984,7 +979,7 @@ static void row_render_scale(void) {
     int cur = -1;
     for (int i = 0; i < ON; i++)
         if (!strcmp(cfg_value("REKARINA_RENDER_SCALE"), ovals[i])) cur = i;
-    opt_choice_list("REKARINA_RENDER_SCALE", UI_MENU_RENDER_SCALE, ovals, onames, ON, UI_MENU_RENDER_SCALE_DESC, cur < 0 ? ON - 1 : cur);
+    opt_choice_list("REKARINA_RENDER_SCALE", UI_MENU_UPSCALE_QUALITY, ovals, onames, ON, UI_MENU_SCENE_SCALE_DESC, cur < 0 ? ON - 1 : cur);
     return;
 #endif
     static const char *const vals[] = {"game", "50", "67", "75", "100", "125", "150", "200"};
@@ -1109,6 +1104,7 @@ static const char *present_note(void) {
 }
 
 // ---- the tabs
+#ifndef GAME_OOT
 // Colour adjustment (vk_color.c): a profile writes the four values (STS78721's presets, issue #136); moving one of them
 // makes the profile Custom.
 static void rows_color(void) {
@@ -1137,53 +1133,110 @@ static void rows_color(void) {
         cfg_save();
     }
 }
+#endif
 
 extern "C" int wide_available(void);
 extern "C" int wide_ui_available(void);
-extern "C" const char *vk_ffx_versions(void);   // vk_ffx.cpp: "" until AMD's library is loaded
 #ifdef GAME_OOT
-extern "C" int vk_dlaa_fsr3(void);
-extern "C" int vk_ffx_upscale_available(void);
+extern "C" unsigned wide_auto_picture_height(void);
+#endif
+extern "C" const char *vk_ffx_versions(void);   // vk_ffx.cpp: "" until AMD's library is loaded
 extern "C" int vk_ffx_fsr4_available(void);
+extern "C" int vk_ffx_probe_fsr4(void);
+#ifdef GAME_OOT
+bool menu_fsr4_selected() {
+    const char *version = cfg_value("REKARINA_FSR_VERSION");
+    return version[0] == '4' || (!strcmp(version, "auto") && vk_ffx_fsr4_available());
+}
 #endif
 
-static void tab_screen(float scale) {
+static void rows_framegen(void);
+
+extern "C" void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]);
+
+static void tab_screen(float scale, const MenuTarget *target) {
+#ifndef GAME_OOT
+    (void)target;
+#endif
     opt_begin("##screen", scale);
+#ifdef GAME_OOT
+    opt_group(UI_MENU_HDR_OUTPUT_GROUP);
+    const char *note = (vk_hdr_wanted() && !vk_hdr_active()) ? menu_text(UI_MENU_HDR_NO_DISPLAY) : nullptr;
+    static const char *const output_values[] = {"0", "1"};
+    static const char *const output_names[] = {"SDR", "HDR"};
+    opt_choice_list("REKARINA_HDR", UI_MENU_HDR_SIGNAL, output_values, output_names, 2, UI_MENU_HDR_DESC, -1, note);
+    const bool hdr_enabled = !strcmp(cfg_value("REKARINA_HDR"), "1");
+    const bool renodx = hdr_enabled && !strcmp(cfg_value("REKARINA_HDR_TONEMAP"), "psychov35");
+    static const UiTextId gamma_modes[] = {UI_MENU_OFF, UI_MENU_HDR_GAMMA_22, UI_MENU_HDR_GAMMA_24};
+#endif
+#ifndef GAME_OOT
     opt_toggle("REKARINA_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
     row_window_size();
+#endif
     static const UiTextId present[] = {UI_MENU_PRESENT_MAILBOX, UI_MENU_PRESENT_VSYNC, UI_MENU_PRESENT_IMMEDIATE};
     opt_choice("REKARINA_VK_PRESENT", UI_MENU_PRESENT, present, 3, UI_MENU_PRESENT_DESC, present_note());
+#ifdef GAME_OOT
+    rows_framegen();
+    opt_group(UI_MENU_INTERFACE_GROUP);
+#else
     row_gpu();
+#endif
     static const UiTextId perf[] = {UI_MENU_PERF_OFF, UI_MENU_PERF_FPS, UI_MENU_PERF_FULL};
     opt_choice("REKARINA_PERF_OVERLAY", UI_MENU_PERF_OVERLAY, perf, 3, UI_MENU_PERF_OVERLAY_DESC);
+#ifndef GAME_OOT
     opt_group(UI_MENU_GRAPHICS);
-#ifdef GAME_OOT   // OoT: the picture's size is the game resolution row below; the scene scale applies at once
-    row_render_scale();
-    {
-        static const UiTextId texq[] = {UI_MENU_TEX_QUALITY_AUTO, UI_MENU_TEX_QUALITY_FULL, UI_MENU_TEX_QUALITY_HALF,
-                                        UI_MENU_TEX_QUALITY_QUARTER};
-        opt_choice("REKARINA_TEX_QUALITY", UI_MENU_TEX_QUALITY, texq, 4, UI_MENU_TEX_QUALITY_DESC);
-    }
-#else
     row_output_res();
     row_render_scale();
     row_shadow_res();
 #endif
+    const auto rows_display_scaling = [&] {
     static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
+#ifdef GAME_OOT
+    int fit[4];
+    gfx_fit_rect(target->image_w, target->image_h, target->window_w, target->window_h, fit);
+    if (fit[2] == target->image_w && fit[3] == target->image_h) {
+        opt_disable_next_text("");
+        opt_text_choice("##hdr_display_scaling", UI_MENU_DISPLAY_SCALING, menu_text(UI_MENU_OV_SCALE_NONE),
+                        nullptr, UI_MENU_DISPLAY_SCALING_DESC);
+    } else if (vk_hdr_active() || (fit[2] <= target->image_w && fit[3] <= target->image_h)) {
+        opt_disable_next(vk_hdr_active() ? UI_MENU_DISPLAY_SCALING_HDR : UI_MENU_OV_SCALE_DOWN);
+        opt_text_choice("##hdr_display_scaling", UI_MENU_DISPLAY_SCALING, menu_text(UI_MENU_UPSCALER_BILINEAR),
+                        nullptr, UI_MENU_DISPLAY_SCALING_DESC);
+    } else {
+        opt_choice("REKARINA_UPSCALER", UI_MENU_DISPLAY_SCALING, up, 2, UI_MENU_DISPLAY_SCALING_DESC);
+    }
+#else
     opt_choice("REKARINA_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
     opt_slider("REKARINA_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
+#endif
     static const UiTextId aspect[] = {UI_MENU_ASPECT_FIT, UI_MENU_ASPECT_STRETCH};
     opt_choice("REKARINA_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
+    };
+    const auto rows_picture = [] {
     if (wide_available()) {   // the generated C has the widescreen patch sets (widescreen.c)
         static const char *const shape[] = {"16:9", "window", "21:9", "32:9"};
         const char *shape_names[] = {"16:9", menu_text(UI_MENU_GAME_RES_NATIVE), "21:9", "32:9"};
         opt_choice_list("REKARINA_GAME_ASPECT", UI_MENU_GAME_ASPECT, shape, shape_names, 4, UI_MENU_GAME_ASPECT_DESC);
         static const char *const pic_res[] = {"720", "900", "1080", "1440", "1800", "2160", "2880", "window"};
+#ifdef GAME_OOT
+        char auto_height[48];
+        snprintf(auto_height, sizeof auto_height, menu_text(UI_MENU_AUTO_RESOLUTION), wide_auto_picture_height());
+#endif
         const char *pic_res_names[] = {"720p", "900p", "1080p", "1440p", "1800p", "2160p (4K)", "2880p (5K)",
+#ifdef GAME_OOT
+                                       auto_height};
+#else
                                        menu_text(UI_MENU_GAME_RES_NATIVE)};
+#endif
+#ifdef GAME_OOT
+        opt_choice_list("REKARINA_GAME_RES", UI_MENU_PICTURE_RES, pic_res, pic_res_names, 8, UI_MENU_PICTURE_RES_DESC);
+#else
         opt_choice_list("REKARINA_GAME_RES", UI_MENU_GAME_RES, pic_res, pic_res_names, 8, UI_MENU_GAME_RES_DESC);
+#endif
     }
-    if (wide_ui_available()) {   // ultrawide HUD edge anchoring and custom placement (wide_ui.c)
+    };
+    const auto rows_hud = [] {
+        if (!wide_ui_available()) return;
         static const UiTextId hud_modes[] = {UI_MENU_HUD_EDGES, UI_MENU_HUD_CENTER, UI_MENU_HUD_CUSTOM};
         opt_choice("REKARINA_HUD_LAYOUT", UI_MENU_HUD_LAYOUT, hud_modes, 3, UI_MENU_HUD_LAYOUT_DESC);
         if (!strcmp(cfg_value("REKARINA_HUD_LAYOUT"), "custom")) {
@@ -1209,174 +1262,209 @@ static void tab_screen(float scale) {
                 opt_save_soon();
             }
         }
-    }
+    };
+    const auto rows_rendering = [] {
 #ifndef GAME_OOT   // the field of view and the shadow settings are patches of TotK
-    opt_slider("REKARINA_FOV", UI_MENU_FOV, 70, 140, UI_MENU_FOV_DESC, 5, "%.0f %%");
+        opt_slider("REKARINA_FOV", UI_MENU_FOV, 70, 140, UI_MENU_FOV_DESC, 5, "%.0f %%");
 #else   // OoT's field of view: the set fov of recomp/patches-oot-v111.txt, when the generated C has it
-    if (rt_patch_set("fov") >= 0) opt_slider("REKARINA_FOV", UI_MENU_FOV, 70, 140, UI_MENU_FOV_DESC_OOT, 5, "%.0f %%");
+        opt_group(UI_MENU_3D_RENDERING);
+        row_gpu();
+        static const UiTextId texq[] = {UI_MENU_TEX_QUALITY_AUTO, UI_MENU_TEX_QUALITY_FULL, UI_MENU_TEX_QUALITY_HALF,
+                                        UI_MENU_TEX_QUALITY_QUARTER};
+        opt_choice("REKARINA_TEX_QUALITY", UI_MENU_TEX_QUALITY, texq, 4, UI_MENU_TEX_QUALITY_DESC);
+        if (rt_patch_set("fov") >= 0) opt_slider("REKARINA_FOV", UI_MENU_FOV, 70, 140, UI_MENU_FOV_DESC_OOT, 5, "%.0f %%");
 #endif
-    static const char *const aniso[] = {"game", "2", "4", "8", "16"};
-    const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
-    opt_choice_list("REKARINA_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
+        static const char *const aniso[] = {"game", "2", "4", "8", "16"};
+        const char *aniso_names[] = {menu_text(UI_MENU_ANISO_GAME), "2x", "4x", "8x", "16x"};
+        opt_choice_list("REKARINA_ANISO", UI_MENU_ANISO, aniso, aniso_names, 5, UI_MENU_ANISO_DESC);
 #ifdef GAME_OOT
-    opt_slider("REKARINA_TEXTURE_LOD_STRENGTH", UI_MENU_TEXTURE_LOD_STRENGTH, 0, 0.5f, UI_MENU_TEXTURE_LOD_STRENGTH_DESC,
-               0.025f, "%+.3f mip", nullptr, nullptr, false, 1, 0,
-               [](double strength) { return 0.005 * (100 - fmin(100, fmax(0, strength))); },
-               [](double mips) { return 100 - 200 * mips; });
+        opt_slider("REKARINA_TEXTURE_LOD_STRENGTH", UI_MENU_TEXTURE_LOD_STRENGTH, 0, 0.5f, UI_MENU_TEXTURE_LOD_STRENGTH_DESC,
+                   0.025f, "%+.3f mip", nullptr, nullptr, false, 1, 0,
+                   [](double strength) { return 0.005 * (100 - fmin(100, fmax(0, strength))); },
+                   [](double mips) { return 100 - 200 * mips; });
 #endif
+    };
 #ifndef GAME_OOT
+    rows_display_scaling();
+    rows_picture();
+    rows_hud();
+    rows_rendering();
     row_shadow_scale();
     row_shadow_range();
     opt_slider("REKARINA_PCSS", UI_MENU_PCSS, 0, 200, UI_MENU_PCSS_DESC, 10, "%.0f %%");
     opt_slider("REKARINA_CONTACT_SHADOWS", UI_MENU_CONTACT_SHADOWS, 0, 100, UI_MENU_CONTACT_SHADOWS_DESC, 10, "%.0f %%");
-#endif
-    rows_color();   // with the picture's rows: the group below is the upscalers'
+    rows_color();
     opt_group(UI_MENU_UPSCALE_GROUP);
-    // frame generation takes DLSS / DLAA's depth and motion vectors and keeps it on (vk_dlaa.c vk_dlaa_wanted)
-    const char *fg_now = cfg_value("REKARINA_FRAMEGEN");
-    if (strcmp(fg_now, "off") && cfg_bool("REKARINA_DLAA")) opt_disable_next(UI_MENU_DLAA_FOR_FG);
+#endif
+#ifdef GAME_OOT
+    rows_hud();
+    if (hdr_enabled) {
+        opt_slider("REKARINA_HDR_UI_NITS", UI_MENU_HDR_UI, 48, 500, UI_MENU_HDR_UI_DESC, 5, "%.0f nits", nullptr, nullptr, true);
+        if (renodx) opt_choice("REKARINA_HDR_UI_EOTF", UI_MENU_HDR_UI_EOTF, gamma_modes, 3, UI_MENU_HDR_UI_EOTF_DESC);
+    }
+    opt_group(UI_MENU_SCALING_GROUP);
+    const bool aa_on = cfg_bool("REKARINA_DLAA");
+    const bool aa_locked = cfg_from_env("REKARINA_DLAA"), taa_locked = cfg_from_env("REKARINA_TAA");
+    const bool version_locked = cfg_from_env("REKARINA_FSR_VERSION");
+    const char *backend = cfg_value("REKARINA_TAA");
+    const bool fsr4_available = vk_ffx_probe_fsr4();
+    const bool fsr4_selected = menu_fsr4_selected();
+    enum { Bilinear, Vanilla, Dlss, Fsr4, Fsr3, Fsr1, Count };
+    const char *const methods[] = {"bilinear", nullptr, "dlss", "fsr3", "fsr3", "fsr1"};
+    const char *const method_names[] = {menu_text(UI_MENU_SCENE_BILINEAR), menu_text(UI_MENU_SCENE_VANILLA),
+                                        "DLSS", "FSR4", "FSR3", "FSR1"};
+    int choices[Count], n_methods = 0, method = Vanilla, current = -1;
+    for (int i = 0; i < Count; i++) {
+        const bool amd = i == Fsr4 || i == Fsr3;
+        if (i != Vanilla && aa_on && !strcmp(backend, methods[i]) && (!amd || fsr4_selected == (i == Fsr4))) method = i;
+        if ((aa_locked && aa_on != (i != Vanilla)) || (i != Vanilla && taa_locked && strcmp(backend, methods[i])) ||
+            (i == Fsr4 && !fsr4_available && method != Fsr4) || (amd && version_locked && fsr4_selected != (i == Fsr4))) continue;
+        choices[n_methods++] = i;
+    }
+    for (int i = 0; i < n_methods; i++) if (choices[i] == method) current = i;
+    if (n_methods < 2) opt_disable_next_text("");
+    const char *taa_note = aa_on && method != Bilinear && !vk_dlaa_backend_available() ? menu_text(UI_MENU_TAA_UNAVAILABLE)
+        : method == Fsr1 && !strcmp(cfg_value("REKARINA_DLSS"), "dlaa") ? menu_text(UI_PIC_FLOW_NATIVE_FSR1) : nullptr;
+    int step = opt_text_choice("##scene_upscaler", UI_MENU_SCENE_UPSCALER, method_names[method], taa_note, UI_MENU_SCENE_UPSCALER_DESC);
+    if (step && n_methods > 1) {
+        int next = step == 2 ? (current + 1) % n_methods : current + step;
+        if (next < 0) next = 0;
+        if (next >= n_methods) next = n_methods - 1;
+        if (next != current) {
+            int selected = choices[next];
+            if (selected != Vanilla) cfg_set("REKARINA_TAA", methods[selected]);
+            if (!version_locked && (selected == Fsr4 || selected == Fsr3))
+                cfg_set("REKARINA_FSR_VERSION", selected == Fsr4 ? "4" : "3");
+            cfg_set("REKARINA_DLAA", selected == Vanilla ? "0" : "1");
+            opt_save_soon();
+        }
+    }
+#else
+    if (strcmp(cfg_value("REKARINA_FRAMEGEN"), "off") && cfg_bool("REKARINA_DLAA")) opt_disable_next(UI_MENU_DLAA_FOR_FG);
     opt_toggle("REKARINA_DLAA", UI_MENU_DLAA, UI_MENU_DLAA_DESC);
     static const char *const taa[] = {"dlss", "fsr3", "fsr1"};
     const char *taa_names[] = {"NVIDIA DLSS", "AMD FSR", "AMD FSR 1"};
     opt_choice_list("REKARINA_TAA", UI_MENU_TAA, taa, taa_names, 3, UI_MENU_TAA_DESC);
-    // Frame generation: Off, NVIDIA DLSS (an RTX 40 or 50 card with its libraries, vk_dlssg_offered) and AMD FSR 3.1
-    // (any card with AMD's libraries, vk_fg_offered); the row lists only what can run here and says why a kind is
-    // missing. Turned on from the base mode it turns DLSS / DLAA on with it, whose depth and motion vectors it takes
-    // (the start does the same for a rekarina.ini line: vk_dlaa.c vk_dlaa_wanted). It applies at the next start, as the
-    // device's queues and the swapchain are made for it. Asked for at start but not running: the row says why, as the log
-    // does. Only TotK can fall back to AMD when DLSS frame generation is unavailable.
-    {
-        const char *why_dlss = nullptr, *why_fsr = nullptr;
-        int dlss_ok = vk_dlssg_offered(&why_dlss), fsr_ok = vk_fg_offered(&why_fsr), n = 0;
-        const char *values[3], *names[3];
-        values[n] = "off", names[n++] = menu_text(UI_MENU_OFF);
-        if (dlss_ok) values[n] = "dlss", names[n++] = "NVIDIA DLSS";
-        if (fsr_ok) values[n] = "fsr3", names[n++] = "AMD FSR 3.1";
-        const char *why = !strcmp(fg_now, "dlss") ? vk_dlssg_off_why() : !strcmp(fg_now, "fsr3") ? vk_fg_off_why() : nullptr;
-        static char fg_note[192];
-        const char *note = nullptr;
-#ifdef GAME_OOT
-        if (vk_fg_restart_needed()) note = menu_text(UI_MENU_AFTER_RESTART);
-        else
 #endif
-        if (why) snprintf(fg_note, sizeof fg_note, menu_text(UI_MENU_FRAMEGEN_OFF), why), note = fg_note;
-        else if (!strcmp(fg_now, "dlss") && vk_fg_instead() && vk_fg_active()) note = menu_text(UI_MENU_FRAMEGEN_INSTEAD);
-        else if (!dlss_ok) note = why_dlss;
-        else if (!fsr_ok) note = why_fsr;
-        else if (vk_dlssg_swapchain_ready() && strcmp(fg_now, "fsr3")) note = "DLSS switches live";
-        if (opt_choice_list("REKARINA_FRAMEGEN", UI_MENU_FRAMEGEN, values, names, n, UI_MENU_FRAMEGEN_DESC, -1, note)) {
-            fg_guard_clear();   // one that stopped a start while being set up is tried again at the next (report.c)
-            if (strcmp(cfg_value("REKARINA_FRAMEGEN"), "off") && !cfg_bool("REKARINA_DLAA")) {
-                cfg_set("REKARINA_DLAA", "1");   // its depth and motion vectors: the dlaa row shows it on
-                opt_save_soon();
-            }
+#ifndef GAME_OOT
+    rows_framegen();
+#endif
+#ifdef GAME_OOT
+    const bool configured_upscaler = cfg_bool("REKARINA_DLAA");
+    const bool nvidia_upscaler = configured_upscaler && cfg_taa() == CFG_TAA_DLSS;
+    if (configured_upscaler && vk_dlaa_backend_available()) {
+        const UiTextId quality[] = {nvidia_upscaler ? UI_MENU_DLSS_DLAA : UI_MENU_UPSCALE_NATIVE,
+                                     UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED, UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
+        char scale_note[48];
+        const double share = res_fixed_scene_share();
+        if (share > 0 && target->image_h > 0) {
+            const unsigned h = (unsigned)lround(target->image_h * share);
+            snprintf(scale_note, sizeof scale_note, share < 1 ? menu_text(UI_MENU_AUTO_RESOLUTION) : "%up", h);
         }
-    }
-    if (vk_reflex_offered()) {
-        static const UiTextId reflex_labels[] = {UI_MENU_OFF, UI_MENU_ON, UI_MENU_REFLEX_BOOST};
-        const char *note = vk_dlssg_active() && !strcmp(cfg_value("REKARINA_REFLEX"), "0")
-                               ? menu_text(UI_MENU_REFLEX_FOR_FG)
-                               : nullptr;
-        opt_choice("REKARINA_REFLEX", UI_MENU_REFLEX, reflex_labels, 3, UI_MENU_REFLEX_DESC, note);
-    }
+        opt_choice("REKARINA_DLSS", UI_MENU_UPSCALE_QUALITY, quality, 5, UI_MENU_UPSCALE_QUALITY_DESC,
+                   share > 0 && target->image_h > 0 ? scale_note : nullptr);
+    } else row_render_scale();
+    if (nvidia_upscaler)
+#else
     static const UiTextId dlss[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
                                     UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
     opt_choice("REKARINA_DLSS", UI_MENU_DLSS, dlss, 5, UI_MENU_DLSS_DESC);
+#endif
     {   // the DLSS model: the letters are NVIDIA's own names for them (vk_dlaa.c preset_value)
         static const char *const preset[] = {"default", "k", "m", "l", "j", "e"};
         const char *preset_names[] = {menu_text(UI_MENU_DLSS_PRESET_DEFAULT), "K \xc2\xb7 Transformer", "M \xc2\xb7 Transformer 2",
                                       "L \xc2\xb7 Transformer 2", "J \xc2\xb7 Transformer", "E \xc2\xb7 CNN"};
         opt_choice_list("REKARINA_DLSS_PRESET", UI_MENU_DLSS_PRESET, preset, preset_names, 6, UI_MENU_DLSS_PRESET_DESC);
     }
+#ifndef GAME_OOT
     {   // the FSR upscaler's version; under the value, the versions AMD's library offers on this card once it is loaded
-        const char *fsr[] = {"auto", "4", "3"};
+        static const char *const fsr[] = {"auto", "4", "3"};
         const char *fsr_names[] = {menu_text(UI_MENU_DLSS_PRESET_DEFAULT), "FSR 4.1", "FSR 3.1"};
         const char *have = vk_ffx_versions();
-        const char *note = *have ? have : nullptr;
-        int count = 3;
-#ifdef GAME_OOT
-        const bool known = *have || vk_dlaa_fsr3();
-        if (known && !vk_ffx_upscale_available()) note = menu_text(UI_MENU_TAA_UNAVAILABLE);
-        if (known && !vk_ffx_fsr4_available() && strcmp(cfg_value("REKARINA_FSR_VERSION"), "4")) {
-            fsr[1] = fsr[2];
-            fsr_names[1] = fsr_names[2];
-            count = 2;
-        }
-#endif
-        opt_choice_list("REKARINA_FSR_VERSION", UI_MENU_FSR_VERSION, fsr, fsr_names, count, UI_MENU_FSR_VERSION_DESC, -1, note);
+        const char *version_note = *have ? have : nullptr;
+        opt_choice_list("REKARINA_FSR_VERSION", UI_MENU_FSR_VERSION, fsr, fsr_names, 3, UI_MENU_FSR_VERSION_DESC, -1, version_note);
     }
+#endif
 #ifndef GAME_OOT
     opt_toggle("REKARINA_FXAA", UI_MENU_FXAA, UI_MENU_FXAA_DESC);
+#else
+    rows_picture();
+    opt_toggle("REKARINA_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
+    row_window_size();
+    rows_display_scaling();
+    if (!cfg_bool("REKARINA_DLAA")) opt_disable_next(UI_MENU_RCAS_NDSR);
+    opt_slider("REKARINA_SHARPNESS", UI_MENU_RCAS_STRENGTH, 0, 100, UI_MENU_RCAS_STRENGTH_DESC, 5, "%.0f %%");
+    opt_group(UI_MENU_TONEMAPPING_GROUP);
 #endif
-    opt_group(UI_MENU_HDR_GROUP);
 #ifdef GAME_OOT
     {
-        static const UiTextId hdr_modes[] = {UI_MENU_OFF, UI_MENU_HDR_RENODX, UI_MENU_HDR_NATIVE};
-        const char *note = vk_hdr_needs_restart() ? menu_text(UI_MENU_AFTER_RESTART)
-                         : (vk_hdr_wanted() && !vk_hdr_active()) ? menu_text(UI_MENU_HDR_NO_DISPLAY)
-                         : vk_hdr_native() ? menu_text(UI_MENU_HDR_NATIVE_ON) : nullptr;
-        opt_choice("REKARINA_HDR", UI_MENU_HDR, hdr_modes, 3, UI_MENU_HDR_DESC, note);
-        const char *hdr = cfg_value("REKARINA_HDR");
-        if (strcmp(hdr, "0")) {
-            opt_slider("REKARINA_HDR_PEAK_NITS", UI_MENU_HDR_PEAK, 400, 10000, UI_MENU_HDR_PEAK_DESC, 50, "%.0f", nullptr, nullptr, true);
-            opt_slider("REKARINA_HDR_GAME_NITS", UI_MENU_HDR_GAME, 48, 500, UI_MENU_HDR_GAME_DESC, 5, "%.0f", nullptr, nullptr, true);
-            opt_slider("REKARINA_HDR_UI_NITS", UI_MENU_HDR_UI, 48, 500, UI_MENU_HDR_UI_DESC, 5, "%.0f", nullptr, nullptr, true);
+        const char *tm_key = hdr_enabled ? "REKARINA_HDR_TONEMAP" : "REKARINA_SDR_TONEMAP";
+        static const UiTextId tm_modes[] = {UI_MENU_HDR_TM_PSYCHO, UI_MENU_HDR_TM_VANILLA};
+        const char *hdr_override = cfg_env("REKARINA_HDR");
+        if (hdr_enabled && hdr_override && !strcmp(hdr_override, "native")) {
+            opt_disable_next_text("REKARINA_HDR=native");
+            opt_text_choice(tm_key, UI_MENU_HDR_TONEMAP, menu_text(UI_MENU_HDR_TM_VANILLA), nullptr, UI_MENU_HDR_TONEMAP_DESC);
+        } else opt_choice(tm_key, UI_MENU_HDR_TONEMAP, tm_modes, 2, UI_MENU_HDR_TONEMAP_DESC);
+        const bool psycho = !strcmp(cfg_value(tm_key), "psychov35");
+        if (hdr_enabled) {
+            opt_slider("REKARINA_HDR_PEAK_NITS", UI_MENU_HDR_PEAK, 400, 10000, UI_MENU_HDR_PEAK_DESC, 50, "%.0f nits", nullptr, nullptr, true);
+            opt_slider("REKARINA_HDR_GAME_NITS", UI_MENU_HDR_GAME, 48, 500, UI_MENU_HDR_GAME_DESC, 5, "%.0f nits", nullptr, nullptr, true);
         }
-        if (!strcmp(hdr, "1")) {
-            static const UiTextId gamma_modes[] = {UI_MENU_HDR_GAMMA_OFF, UI_MENU_HDR_GAMMA_22, UI_MENU_HDR_GAMMA_24};
-            opt_choice("REKARINA_HDR_GAMMA", UI_MENU_HDR_GAMMA, gamma_modes, 3, UI_MENU_HDR_GAMMA_DESC);
-            static const char *const spaces[] = {"bt709", "p3"};   // the names of the gamuts, in every language
-            const char *space_names[] = {"BT.709", "DCI-P3"};
-            opt_choice_list("REKARINA_HDR_COLOR_SPACE", UI_MENU_HDR_COLOR_SPACE, spaces, space_names, 2,
-                            UI_MENU_HDR_COLOR_SPACE_DESC);
-            static const UiTextId tm_modes[] = {UI_MENU_HDR_TM_PSYCHO, UI_MENU_HDR_TM_RENODRT, UI_MENU_HDR_TM_VANILLA};
-            opt_choice("REKARINA_HDR_TONEMAP", UI_MENU_HDR_TONEMAP, tm_modes, 3, UI_MENU_HDR_TONEMAP_DESC);
-            const char *tm = cfg_value("REKARINA_HDR_TONEMAP");
-            if (strcmp(tm, "vanilla")) {
-                int is_drt = !strcmp(tm, "renodrt");
-                if (!is_drt) {
-                    static const UiTextId mg_modes[] = {UI_MENU_HDR_MIDGRAY_VANILLA, UI_MENU_HDR_MIDGRAY_RENDER,
-                                                        UI_MENU_HDR_MIDGRAY_ADAPTATION};
-                    bool eye_adaptation = vk_hdr_adaptation_supported();
-                    opt_choice("REKARINA_HDR_MIDGRAY", UI_MENU_HDR_MIDGRAY, mg_modes,
-                               eye_adaptation ? 3 : 2, UI_MENU_HDR_MIDGRAY_DESC);
-                    if (eye_adaptation && !strcmp(cfg_value("REKARINA_HDR_MIDGRAY"), "adaptation")) {
-                        opt_slider("REKARINA_HDR_ADAPTATION_TARGET", UI_MENU_HDR_ADAPTATION_TARGET, 1, 100,
-                                   UI_MENU_HDR_ADAPTATION_TARGET_DESC, 1, "%.0f %%");
-                        opt_slider("REKARINA_HDR_ADAPTATION_MIN_STOPS", UI_MENU_HDR_ADAPTATION_MIN_STOPS, -8, 0,
-                                   UI_MENU_HDR_ADAPTATION_MIN_STOPS_DESC, 0.5f, "%.1f");
-                        opt_slider("REKARINA_HDR_ADAPTATION_MAX_STOPS", UI_MENU_HDR_ADAPTATION_MAX_STOPS, 0, 8,
-                                   UI_MENU_HDR_ADAPTATION_MAX_STOPS_DESC, 0.5f, "%.1f");
-                    }
-                    opt_toggle("REKARINA_HDR_MATCH_SLOPE", UI_MENU_HDR_MATCH_SLOPE, UI_MENU_HDR_MATCH_SLOPE_DESC);
-                    opt_slider("REKARINA_HDR_TONE_SLOPE", UI_MENU_HDR_TONE_SLOPE, 0, 100, UI_MENU_HDR_TONE_SLOPE_DESC, 5, "%.0f");
-                    opt_slider("REKARINA_HDR_HUE_CLIP", UI_MENU_HDR_HUE_CLIP, 0, 100, UI_MENU_HDR_HUE_CLIP_DESC, 5, "%.0f %%");
+        {
+            const bool eye_adaptation = vk_hdr_adaptation_supported();
+            if (psycho) {
+                if (hdr_enabled) {
+                    opt_choice("REKARINA_HDR_GAMMA", UI_MENU_HDR_RENDER_EOTF, gamma_modes, 3, UI_MENU_HDR_RENDER_EOTF_DESC);
                 }
-                const char *exposure_format = cfg_double("REKARINA_HDR_EXPOSURE") <= 0 ? "0%%" : "%+.2f EV";
-                opt_slider("REKARINA_HDR_EXPOSURE", UI_MENU_HDR_EXPOSURE, -3, 3, UI_MENU_HDR_EXPOSURE_DESC, 0.05f, exposure_format,
-                           nullptr, nullptr, false, 1, 0, [](double v) { return v > 0 ? log2(v / 100) : -3.0; },
-                           [](double ev) { return 100 * exp2(ev); });
-                opt_slider("REKARINA_HDR_HIGHLIGHTS", UI_MENU_HDR_HIGHLIGHTS, 0, 100, UI_MENU_HDR_HIGHLIGHTS_DESC, 5, "%.0f");
-                opt_slider("REKARINA_HDR_SHADOWS", UI_MENU_HDR_SHADOWS, 0, 100, UI_MENU_HDR_SHADOWS_DESC, 5, "%.0f");
-                opt_slider("REKARINA_HDR_CONTRAST", UI_MENU_HDR_CONTRAST, 0, 100, UI_MENU_HDR_CONTRAST_DESC, 5, "%.0f");
-                opt_slider("REKARINA_HDR_SATURATION", UI_MENU_HDR_SATURATION, 0, 100, UI_MENU_HDR_SATURATION_DESC, 5, "%.0f");
-                if (is_drt) {
-                    opt_slider("REKARINA_HDR_HIGHLIGHT_SAT", UI_MENU_HDR_HIGHLIGHT_SAT, 0, 100, UI_MENU_HDR_HIGHLIGHT_SAT_DESC, 5, "%.0f");
-                    opt_slider("REKARINA_HDR_BLOWOUT", UI_MENU_HDR_BLOWOUT, 0, 100, UI_MENU_HDR_BLOWOUT_DESC, 5, "%.0f %%");
-                    opt_slider("REKARINA_HDR_FLARE", UI_MENU_HDR_FLARE, 0, 100, UI_MENU_HDR_FLARE_DESC, 5, "%.0f");
-                    opt_slider("REKARINA_HDR_HUE", UI_MENU_HDR_HUE, 0, 100, UI_MENU_HDR_HUE_DESC, 5, "%.0f %%");
-                    opt_slider("REKARINA_HDR_GRADE", UI_MENU_HDR_GRADE, 0, 100, UI_MENU_HDR_GRADE_DESC, 5, "%.0f %%");
+                static const UiTextId mg_modes[] = {UI_MENU_HDR_MIDGRAY_VANILLA, UI_MENU_OFF,
+                                                    UI_MENU_HDR_MIDGRAY_ADAPTATION};
+                opt_choice("REKARINA_HDR_MIDGRAY", UI_MENU_HDR_MIDGRAY, mg_modes,
+                           eye_adaptation ? 3 : 2, UI_MENU_HDR_MIDGRAY_DESC);
+                opt_toggle("REKARINA_HDR_MATCH_SLOPE", UI_MENU_HDR_MATCH_SLOPE, UI_MENU_HDR_MATCH_SLOPE_DESC);
+                opt_slider("REKARINA_HDR_TONE_SLOPE", UI_MENU_HDR_TONE_SLOPE, 0, 2, UI_MENU_HDR_TONE_SLOPE_DESC, 0.1f,
+                           "%.2fx", nullptr, nullptr, false, 0.02);
+                opt_slider("REKARINA_HDR_HUE_CLIP", UI_MENU_HDR_HUE_CLIP, 0, 100, UI_MENU_HDR_HUE_CLIP_DESC, 5, "%.0f %%");
+                if (eye_adaptation && !strcmp(cfg_value("REKARINA_HDR_MIDGRAY"), "adaptation")) {
+                    opt_slider("REKARINA_HDR_ADAPTATION_TARGET", UI_MENU_HDR_ADAPTATION_TARGET, 1, 100,
+                               UI_MENU_HDR_ADAPTATION_TARGET_DESC, 1, "%.1f %%");
+                    opt_slider("REKARINA_HDR_ADAPTATION_MIN_STOPS", UI_MENU_HDR_ADAPTATION_MIN_STOPS, -8, 0,
+                               UI_MENU_HDR_ADAPTATION_MIN_STOPS_DESC, 0.5f, "%+.1f");
+                    opt_slider("REKARINA_HDR_ADAPTATION_MAX_STOPS", UI_MENU_HDR_ADAPTATION_MAX_STOPS, 0, 8,
+                               UI_MENU_HDR_ADAPTATION_MAX_STOPS_DESC, 0.5f, "%+.1f");
                 }
             }
-            // the game's bloom, with every tone mapper (vk_hdr.c tonemap_splice scales it where the scene adds it)
-            opt_slider("REKARINA_HDR_BLOOM", UI_MENU_HDR_BLOOM, 0, 100, UI_MENU_HDR_BLOOM_DESC, 5, "%.0f");
-            if (!strcmp(tm, "vanilla") || !strcmp(tm, "renodrt")) {
-                opt_slider("REKARINA_HDR_LOCAL_EXPOSURE", UI_MENU_HDR_LOCAL_EXPOSURE, 0, 100,
-                           UI_MENU_HDR_LOCAL_EXPOSURE_DESC, 5, "%.0f");
+        }
+        opt_group(UI_MENU_GRADING_GROUP);
+        const char *exposure_format = cfg_double("REKARINA_HDR_EXPOSURE") <= 0 ? "0%%" : "%+.2f EV";
+        opt_slider("REKARINA_HDR_EXPOSURE", UI_MENU_HDR_EXPOSURE, -3, 3, UI_MENU_HDR_EXPOSURE_DESC, 0.05f, exposure_format,
+                   nullptr, nullptr, false, 1, 0, [](double v) { return v > 0 ? log2(v / 100) : -3.0; },
+                   [](double ev) { return 100 * exp2(ev); });
+        opt_slider("REKARINA_HDR_HIGHLIGHTS", UI_MENU_HDR_HIGHLIGHTS, 0, 200, UI_MENU_HDR_HIGHLIGHTS_DESC, 10,
+                   "%.0f %%", nullptr, nullptr, false, 2);
+        opt_slider("REKARINA_HDR_SHADOWS", UI_MENU_HDR_SHADOWS, 0, 200, UI_MENU_HDR_SHADOWS_DESC, 10,
+                   "%.0f %%", nullptr, nullptr, false, 2);
+        opt_slider("REKARINA_HDR_CONTRAST", UI_MENU_HDR_CONTRAST, 0, 200, UI_MENU_HDR_CONTRAST_DESC, 10,
+                   "%.0f %%", nullptr, nullptr, false, 2);
+        opt_slider("REKARINA_HDR_SATURATION", UI_MENU_HDR_SATURATION, 0, 200, UI_MENU_HDR_SATURATION_DESC, 10,
+                   "%.0f %%", nullptr, nullptr, false, 2);
+        if (hdr_enabled) {
+            if (opt_button("##hdr_reset", UI_MENU_HDR_RESET, UI_MENU_HDR_RESET_DESC)) {
+                static const char *const keys[] = {
+                    "HDR_GAME_NITS", "HDR_UI_NITS", "HDR_GAMMA", "HDR_UI_EOTF", "HDR_TONEMAP",
+                    "HDR_MIDGRAY", "HDR_MATCH_SLOPE", "HDR_TONE_SLOPE", "HDR_HUE_CLIP", "HDR_EXPOSURE", "HDR_HIGHLIGHTS",
+                    "HDR_SHADOWS", "HDR_CONTRAST", "HDR_SATURATION", "HDR_ADAPTATION_TARGET", "HDR_ADAPTATION_MIN_STOPS",
+                    "HDR_ADAPTATION_MAX_STOPS", "HDR_BLOOM",
+                };
+                cfg_reset(keys, sizeof keys / sizeof *keys);
             }
         }
+        opt_group(UI_MENU_HDR_EFFECTS_GROUP);
+        opt_slider("REKARINA_HDR_BLOOM", UI_MENU_HDR_BLOOM, 0, 200, UI_MENU_HDR_BLOOM_DESC, 10,
+                   "%.0f %%", nullptr, nullptr, false, 2);
+        rows_rendering();
     }
 #else
+    opt_group(UI_MENU_HDR_GROUP);
     opt_toggle("REKARINA_HDR", UI_MENU_HDR, UI_MENU_HDR_DESC);
     opt_slider("REKARINA_HDR_PEAK_NITS", UI_MENU_HDR_PEAK, 400, 10000, UI_MENU_HDR_PEAK_DESC, 50, "%.0f", nullptr, nullptr, true);
     // brightness in nits: logarithmic bars, as the eye takes light; the 203 default near the middle
@@ -1385,6 +1473,50 @@ static void tab_screen(float scale) {
     opt_slider("REKARINA_HDR_HUE", UI_MENU_HDR_HUE, 0, 100, UI_MENU_HDR_HUE_DESC, 5, "%.0f %%");
 #endif
     opt_end();
+}
+
+static void rows_framegen(void) {
+    const char *fg_now = cfg_value("REKARINA_FRAMEGEN");
+#ifdef GAME_OOT
+    constexpr UiTextId desc = UI_MENU_FRAMEGEN_OOT_DESC;
+#else
+    constexpr UiTextId desc = UI_MENU_FRAMEGEN_DESC;
+#endif
+    const char *why_dlss = nullptr, *why_fsr = nullptr;
+    int dlss_ok = vk_dlssg_offered(&why_dlss), fsr_ok = vk_fg_offered(&why_fsr), n = 0;
+    const char *values[3], *names[3];
+    values[n] = "off", names[n++] = menu_text(UI_MENU_OFF);
+    if (dlss_ok) values[n] = "dlss", names[n++] = "NVIDIA DLSS";
+    if (fsr_ok) values[n] = "fsr3", names[n++] = "AMD FSR 3.1";
+    const char *why = !strcmp(fg_now, "dlss") ? vk_dlssg_off_why() : !strcmp(fg_now, "fsr3") ? vk_fg_off_why() : nullptr;
+    static char fg_note[192];
+    const char *note = nullptr;
+#ifdef GAME_OOT
+    if (vk_fg_restart_needed()) note = menu_text(UI_MENU_AFTER_RESTART);
+    else
+#endif
+    if (why) snprintf(fg_note, sizeof fg_note, menu_text(UI_MENU_FRAMEGEN_OFF), why), note = fg_note;
+#ifndef GAME_OOT
+    else if (!strcmp(fg_now, "dlss") && vk_fg_instead() && vk_fg_active()) note = menu_text(UI_MENU_FRAMEGEN_INSTEAD);
+#endif
+    else if (!dlss_ok) note = why_dlss;
+    else if (!fsr_ok) note = why_fsr;
+    if (opt_choice_list("REKARINA_FRAMEGEN", UI_MENU_FRAMEGEN, values, names, n, desc, -1, note)) {
+        fg_guard_clear();   // one that stopped a start while being set up is tried again at the next (report.c)
+#ifndef GAME_OOT
+        if (strcmp(cfg_value("REKARINA_FRAMEGEN"), "off") && !cfg_bool("REKARINA_DLAA")) {
+            cfg_set("REKARINA_DLAA", "1");   // its depth and motion vectors: the dlaa row shows it on
+            opt_save_soon();
+        }
+#endif
+    }
+    if (vk_reflex_offered()) {
+        static const UiTextId reflex_labels[] = {UI_MENU_OFF, UI_MENU_ON, UI_MENU_REFLEX_BOOST};
+        const char *note = vk_dlssg_active() && !strcmp(cfg_value("REKARINA_REFLEX"), "0")
+                               ? menu_text(UI_MENU_REFLEX_FOR_FG)
+                               : nullptr;
+        opt_choice("REKARINA_REFLEX", UI_MENU_REFLEX, reflex_labels, 3, UI_MENU_REFLEX_DESC, note);
+    }
 }
 
 static void tab_game(float scale) {
@@ -2284,7 +2416,7 @@ static void layout_menu(const MenuTarget *t, float scale) {
         opt_reserve_bottom(ImGui::GetContentRegionAvail().y - (pb.y - pa.y - inner * 2));
         g_modal = false;
         switch (k) {
-        case TAB_SCREEN: tab_screen(scale); break;
+        case TAB_SCREEN: tab_screen(scale, t); break;
         case TAB_GAME: tab_game(scale); break;
         case TAB_MODS: tab_mods(scale); break;
         case TAB_SOUND: tab_sound(scale); break;
@@ -2307,9 +2439,6 @@ static void layout_menu(const MenuTarget *t, float scale) {
     bool restart_needed = cfg_restart_pending() || mods_changed() || cheats_rebuild_pending();
 #ifdef GAME_OOT
     restart_needed |= vk_fg_restart_needed();
-#endif
-#ifdef GAME_OOT
-    restart_needed = restart_needed || vk_hdr_needs_restart() != 0;
 #endif
     ImGui::SetCursorScreenPos(ImVec2(pa.x + inner, btn_y));
     if (plate_button("##continue", cont, ImVec2(bw, btn_h), scale)) set_open(0);
@@ -2488,7 +2617,7 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
             int n = snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS),
                              out_fps > 0 ? out_fps : g_perf_frames * 1e9 / g_perf_win_ns);
             const char *method = gfx_output_fg_method();
-            if (out_fps > 0 && method && n > 0 && n < (int)sizeof g_perf_text)
+            if (method && n > 0 && n < (int)sizeof g_perf_text)
                 snprintf(g_perf_text + n, sizeof g_perf_text - n, " %s", method);
             g_perf_win_ns = g_perf_max_ns = 0;
             g_perf_frames = 0;
@@ -2500,15 +2629,16 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
 static float perf_gb(float mb) { return mb < 0 ? -1 : mb / 1024; }
 
 // in use.
-extern "C" double res_fixed_scene_share(void);
-extern "C" int vk_dlaa_available(void);
-extern "C" int vk_dlaa_fsr1(void);
-extern "C" int vk_dlaa_fsr3(void);
 // Fills labels and v (room for 7 rows of 64 bytes) and returns the number of rows.
 static int perf_picture(const MenuTarget *t, const UiTextId **labels_out, char v[7][64]) {
     unsigned out[2], scene[2];
     res_sizes(out, scene);
-    snprintf(v[0], 64, menu_text(UI_MENU_OV_FMT_SIZE), t->width, t->height);
+#ifdef GAME_OOT
+    const uint32_t window_w = t->window_w, window_h = t->window_h;
+#else
+    const uint32_t window_w = t->width, window_h = t->height;
+#endif
+    snprintf(v[0], 64, menu_text(UI_MENU_OV_FMT_SIZE), window_w, window_h);
     snprintf(v[1], 64, menu_text(UI_MENU_OV_FMT_SIZE), (unsigned)t->image_w, (unsigned)t->image_h);
     double share = res_fixed_scene_share();
     if (share > 0)   // the scene is that share of the game image (frame_rate.c)
@@ -2516,17 +2646,32 @@ static int perf_picture(const MenuTarget *t, const UiTextId **labels_out, char v
                  (unsigned)(t->image_h * share + 0.5), share * 100.0);
     else
         snprintf(v[2], 64, menu_text(UI_MENU_OV_FMT_SCENE), scene[0], scene[1], scene[0] * 100.0 / out[0]);
-    if (share > 0 && share < 0.999 && vk_dlaa_available() && cfg_bool("REKARINA_DLAA")) {   // what scales the scene up
+    const bool scaled = share > 0 && share < 0.999;
+#ifdef GAME_OOT
+    const char *name = t->nvidia_scene_aa;
+    if (!name && vk_dlaa_available()) {
+        if (scaled && vk_dlaa_fsr1()) name = "FSR1";
+        else if (vk_dlaa_fsr3()) name = menu_fsr4_selected() ? "FSR4" : "FSR3";
+    }
+#else
+    const char *name = scaled && vk_dlaa_available() && cfg_bool("REKARINA_DLAA")
+        ? (vk_dlaa_fsr1() ? "FSR1" : vk_dlaa_fsr3() ? "FSR" : "DLSS") : nullptr;
+#endif
+    if (name) {
         size_t n = strlen(v[2]);
-        snprintf(v[2] + n, 64 - n, " \xc2\xb7 %s", vk_dlaa_fsr1() ? "FSR 1" : vk_dlaa_fsr3() ? "FSR" : "DLSS");
+        snprintf(v[2] + n, 64 - n, " \xc2\xb7 %s", name);
     }
     if (t->scaler == 2) {
+#ifdef GAME_OOT
+        snprintf(v[3], 64, "%s", menu_text(UI_MENU_UPSCALER_FSR));
+#else
         int s = cfg_int("REKARINA_SHARPNESS");
         snprintf(v[3], 64, menu_text(UI_MENU_OV_FMT_FSR), s < 0 ? 0 : s > 100 ? 100 : s);
+#endif
     } else {
         // FSR enlarges only (vk_fsr_record): an image larger than the window is shrunk by the blit even with FSR selected
         int down = t->scaler == 1 && !strcmp(cfg_value("REKARINA_UPSCALER"), "fsr") &&
-                   (t->image_w > (int)t->width || t->image_h > (int)t->height);
+                   (t->image_w > (int)window_w || t->image_h > (int)window_h);
         snprintf(v[3], 64, "%s",
                  menu_text(down ? UI_MENU_OV_SCALE_DOWN : t->scaler ? UI_MENU_OV_SCALE_BILINEAR : UI_MENU_OV_SCALE_NONE));
     }
@@ -2988,30 +3133,18 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
     return ImGui::GetDrawData()->TotalVtxCount > 0;
 }
 
-#include "../overlay_coverage_spv.h"
-
-extern "C" int menu_overlay_prepare_coverage(void) {
+extern "C" int menu_overlay_can_replay(void) {
     ImDrawData *data = ImGui::GetDrawData();
     for (int i = 0; i < data->CmdListsCount; ++i)
         for (const ImDrawCmd &draw : data->CmdLists[i]->CmdBuffer)
             if (draw.UserCallback && draw.UserCallback != ImDrawCallback_ResetRenderState) return 0;
-    if (!g_coverage_pipeline) {
-        VkShaderModuleCreateInfo shader_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        shader_info.codeSize = sizeof overlay_coverage_spv;
-        shader_info.pCode = overlay_coverage_spv;
-        VkShaderModule shader;
-        VkDevice device = g_coverage_device;
-        if (vkCreateShaderModule(device, &shader_info, nullptr, &shader) != VK_SUCCESS) return 0;
-        g_coverage_pipeline = ImGui_ImplVulkan_CreateCoveragePipeline(shader);
-        vkDestroyShaderModule(device, shader, nullptr);
-        if (!g_coverage_pipeline) return 0;
-    }
     return 1;
 }
 
-extern "C" void menu_overlay_draw(VkCommandBuffer cb, int coverage) {
-    uint64_t t0 = plat_now_ns();
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb, coverage ? g_coverage_pipeline : VK_NULL_HANDLE);
+extern "C" void menu_overlay_draw(VkCommandBuffer cb, int replay) {
+    uint64_t t0 = replay ? 0 : plat_now_ns();
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
+    if (replay) return;
     g_cost_ns += plat_now_ns() - t0;
     if (++g_cost_frames == 600) {
         rt_log("menu: %.3f ms CPU per open frame (layout and recording, mean of 600)", g_cost_ns / 600 / 1e6);

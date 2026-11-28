@@ -101,7 +101,7 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
 - NVN front end from MacNativeGames (`nvn_api_*.c`, `nvn_obj.h`, texture layout and deswizzle). The game records command buffers through it; nothing reaches the GPU until the game submits.
 - Vulkan 1.3 back end in place of MacNativeGames' Metal one. At `QueueSubmitCommands` the recorded NVN commands are replayed into Vulkan command buffers (`vk_exec*.c`).
 - Memory pools. Apple's unified memory let MacNativeGames use the game's pools zero-copy. The back end imports the pools as host memory (`VK_EXT_external_memory_host`). On a discrete GPU, pools bound as buffers are mirrored in device-local memory and the pages the CPU wrote (write watch, above) are uploaded before a replay; idle pool regions are made read-only so the write-watch queries skip them (`vk_memory.c`). GPU-rendered textures are written back when the CPU reads them: on a pool invalidate, on a CPU copy, and for small targets once the CPU waits for a fence (`vk_texture.c`).
-- Replay thread. `REKARINA_REPLAY_ASYNC=1` moves the replay off the submitting thread onto a queue at most one frame behind the game; reads of GPU results wait for the newest writer instead of draining the queue (`vk_backend.c`). It is off by default. Where the game waits for the GPU it overlaps the replay with the game threads (a GTX 1650 in the Depths, issue #88), a gain measured only there; while it was the default, a GTX 1660 Ti at the 60 fps cap with the GPU at 26 % reported uneven motion (#659). It adds up to a frame of latency; `replay_async = 1` turns it on.
+- Replay thread. `REKARINA_REPLAY_ASYNC=1` (the default) moves the replay off the submitting thread onto a queue at most one frame behind the game; reads of GPU results wait for the newest writer instead of draining the queue (`vk_backend.c`). Where the game waits for the GPU it overlaps the replay with the game threads. It can add up to a frame of latency; if frame pacing is uneven, set `replay_async = 0` and restart to compare.
 - Recorder thread. The Vulkan calls the replay makes into its command buffer are made by a thread of their own (`vk_rec.c`, after Savage Wind Recomp and LAS Recomp): each `vkCmd*` copies its arguments into a packet of a ring and the recorder makes the calls in order; calls into other command buffers are made at once; the recorder also ends the command buffer, and the submit waits until it has. In the town on an RX 9070 the replay takes 17% less time on the submitting thread. It is off by default on AMD GPUs, where the driver loses the device or hangs the GPU at startup with it (`REKARINA_VK_RECORDER=1` forces it on, `=0` makes every call on the submitting thread).
 - Uniform snapshot. The game rewrites per-object uniform blocks on other threads soon after it submits the frame
   that reads them, while the replay still records it. At the start of a submission's replay every uniform range it
@@ -147,7 +147,8 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   the uniform snapshot keeps both) and writes the difference into the motion image. `REKARINA_MV_CHECK` measures the
   vectors against the picture, `REKARINA_DLAA_TIMES` times the passes on the GPU. `fxaa` switches the game's own FXAA pass.
   OoT 1.1.1 jitters the projection on the CPU instead of the viewport (`patch_scene_projection`, on by default; after
-  ShortFuse's NX2navi port, MIT); DLSS still resolves at the game's scaling dispatch by default. Two patched calls
+  ShortFuse's NX2navi port, MIT); DLSS tries the checked pre-bloom route before falling back to the game's
+  scaling dispatch. Two patched calls
   (`scene_projection_impl.h` `scene_projection_build`, `scene_projection_complete`) follow the scene's owner and view,
   offset the projection the game builds by a Halton phase (16 phases at DLAA) and record a scene-complete sample with
   the extents of its colour and depth attachments. The resolve takes that CPU camera sample and checks the settings,
@@ -162,7 +163,7 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   committed sample. With the patch off, the viewport jitter above applies.
 
   For comparison, `dlaa_pre_bloom = 1` (`REKARINA_DLAA_PRE_BLOOM`, off by default, read at start) opts into the
-  native NVIDIA DLAA path on OoT when [checked pre-bloom DLSS](./oot-architecture.md#experimental-pre-bloom-dlss)
+  native NVIDIA DLAA path on OoT when [checked pre-bloom DLSS](./oot-architecture.md#checked-pre-bloom-reconstruction)
   is disabled. It resolves before bloom so bloom and tone mapping read the anti-aliased scene
   (`vk_dlaa.c` `pre_bloom_draw`). DLSS writes back into the R11G11B10F light target right before the bloom chain's first
   draw: a pass of two R11G11B10F targets without depth whose fragment shader's input id begins `865a04d320227ae3` and

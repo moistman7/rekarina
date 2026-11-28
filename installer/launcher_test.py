@@ -611,15 +611,15 @@ class GpuTest(unittest.TestCase):
             r = components.preset(self.gpu(name, gb) if name else None, have)
             return r['id'], r['tex'], r['settings']
 
-        # RTX 40/50 12+ GB starts with DLAA; other RTX 20+ starts with DLSS Quality; framegen stays off
-        self.assertEqual(p('NVIDIA GeForce RTX 5070', 11.94), ('rtx_dlaa', 'auto', {
-            'dlaa': '1', 'taa': 'dlss', 'dlss': 'dlaa', 'framegen': 'off', 'tex_quality': 'auto'}))
-        self.assertEqual(p('NVIDIA GeForce RTX 4090', 24)[0], 'rtx_dlaa')
-        self.assertEqual(p('NVIDIA GeForce RTX 4060', 8), ('rtx_dlss', 'auto', {
-            'dlaa': '1', 'taa': 'dlss', 'dlss': 'quality', 'framegen': 'off', 'tex_quality': 'auto'}))
-        self.assertEqual(p('NVIDIA GeForce RTX 3080', 10)[0], 'rtx_dlss')
-        self.assertEqual(p('NVIDIA GeForce RTX 2060', 6)[:2], ('rtx_dlss', 'half'))
-        self.assertEqual(p('NVIDIA GeForce RTX 3050 Laptop GPU', 4), ('rtx_dlss', 'quarter', {
+        # Select DLSS on RTX without enabling temporal upscaling or frame generation.
+        self.assertEqual(p('NVIDIA GeForce RTX 5070', 11.94), ('rtx_base', 'auto', {
+            'dlaa': '0', 'taa': 'dlss', 'framegen': 'off', 'tex_quality': 'auto'}))
+        self.assertEqual(p('NVIDIA GeForce RTX 4090', 24)[0], 'rtx_base')
+        self.assertEqual(p('NVIDIA GeForce RTX 4060', 8), ('rtx_base', 'auto', {
+            'dlaa': '0', 'taa': 'dlss', 'framegen': 'off', 'tex_quality': 'auto'}))
+        self.assertEqual(p('NVIDIA GeForce RTX 3080', 10)[0], 'rtx_base')
+        self.assertEqual(p('NVIDIA GeForce RTX 2060', 6)[:2], ('rtx_base', 'half'))
+        self.assertEqual(p('NVIDIA GeForce RTX 3050 Laptop GPU', 4), ('rtx_base', 'quarter', {
             'dlaa': '1', 'taa': 'fsr1', 'framegen': 'off', 'dlss': 'quality', 'tex_quality': 'quarter'}))
         self.assertEqual(p('AMD Radeon RX 7800 XT', 16), ('base', 'auto', {
             'dlaa': '0', 'taa': 'fsr3', 'framegen': 'off', 'tex_quality': 'auto'}))
@@ -635,9 +635,9 @@ class GpuTest(unittest.TestCase):
         self.assertEqual(p('AMD Radeon 780M Graphics', 6)[:2], ('handheld', 'half'))
         self.assertEqual(p('Intel(R) Arc(TM) Graphics', 8)[0], 'handheld')
         self.assertEqual(p(None, 0), ('base', 'auto', {'dlaa': '0', 'taa': 'fsr3', 'framegen': 'off', 'tex_quality': 'auto'}))
-        self.assertEqual(p('NVIDIA GeForce RTX 5070', 0)[0], 'rtx_dlss')            # memory unknown
+        self.assertEqual(p('NVIDIA GeForce RTX 5070', 0)[0], 'rtx_base')            # memory unknown
         # a preset never switches on a library that is not in the folder
-        self.assertEqual(p('NVIDIA GeForce RTX 5070', 12, {'fsr', 'dlss'})[0], 'rtx_dlaa')
+        self.assertEqual(p('NVIDIA GeForce RTX 5070', 12, {'fsr', 'dlss'})[0], 'rtx_base')
         self.assertEqual(p('NVIDIA GeForce RTX 5070', 12, {'fsr'})[0], 'base')
         self.assertEqual(p('NVIDIA GeForce RTX 5070', 12, set())[0], 'base')
 

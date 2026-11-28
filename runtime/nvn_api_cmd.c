@@ -720,7 +720,10 @@ NVN_API(nvnCommandBufferBeginRecording) {
     if (o->recording) rt_log("nvn: BeginRecording on command buffer %p while it records", (void *)o);
     o->recording = 1;
 #ifdef GAME_OOT
-    if (vk_dlaa_record_model_motion() && !vk_dlaa_reverse_only()) o->recording |= REC_MODEL_SCOPE;
+    const CfgRenderState *settings = cfg_render_frame_acquire();
+    const CfgRenderValues *frame = cfg_render_values_of(settings);
+    if (frame && frame->motion_models && !frame->motion_reverse_only) o->recording |= REC_MODEL_SCOPE;
+    cfg_render_release(settings);
 #endif
     FT(FT_NOTE, 40, (uintptr_t)o, 0);   // DEBUG-FTRACE: a recording begins (which thread, when)
     o->cur = o->seg;   // the previous recording was copied at EndRecording
@@ -742,7 +745,7 @@ NVN_API(nvnCommandBufferEndRecording) {
     if (!o->ctl_size) memory_event(c, o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, MIN_CONTROL_SIZE);
     put_hdr(cmd_alloc(o, 8), OP_END, 8);
     o->hw_used -= 8;
-    size_t front = (o->recording & REC_HEAP_HO) ? sizeof(copy_prefix) : 0;   // REKARINA_CMD_HANDOVER's prefix room
+    size_t front = o->recording & REC_HEAP_HO ? sizeof(copy_prefix) : 0;   // REKARINA_CMD_HANDOVER's prefix room
     o->recording = 0;
     FT(FT_NOTE, 41, (uintptr_t)o, (uint64_t)(o->cur - o->seg));   // DEBUG-FTRACE: it ends, with its bytes
     uint8_t *copy;

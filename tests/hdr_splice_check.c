@@ -36,12 +36,13 @@ const char *cfg_value(const char *name) {
     const char *v = cfg_get(name);
     if (v) return v;
     if (!strcmp(name, "REKARINA_HDR")) return "1";
-    if (!strcmp(name, "REKARINA_HDR_LIVE")) return "1";
     if (!strcmp(name, "REKARINA_HDR_PEAK_NITS")) return "1000";
     if (!strcmp(name, "REKARINA_HDR_GAME_NITS")) return "203";
     if (!strcmp(name, "REKARINA_HDR_UI_NITS")) return "203";
-    if (!strcmp(name, "REKARINA_HDR_GAMMA")) return "2.2";
+    if (!strcmp(name, "REKARINA_HDR_GAMMA")) return "off";
+    if (!strcmp(name, "REKARINA_HDR_UI_EOTF")) return "2.2";
     if (!strcmp(name, "REKARINA_HDR_TONEMAP")) return "psychov35";
+    if (!strcmp(name, "REKARINA_SDR_TONEMAP")) return "vanilla";
     if (!strcmp(name, "REKARINA_HDR_MIDGRAY")) return "vanilla";
     if (!strcmp(name, "REKARINA_HDR_MATCH_SLOPE")) return "1";
     if (!strcmp(name, "REKARINA_HDR_TONE_SLOPE")) return "50";
@@ -51,11 +52,6 @@ const char *cfg_value(const char *name) {
     if (!strcmp(name, "REKARINA_HDR_SHADOWS")) return "50";
     if (!strcmp(name, "REKARINA_HDR_CONTRAST")) return "50";
     if (!strcmp(name, "REKARINA_HDR_SATURATION")) return "50";
-    if (!strcmp(name, "REKARINA_HDR_HIGHLIGHT_SAT")) return "50";
-    if (!strcmp(name, "REKARINA_HDR_BLOWOUT")) return "0";
-    if (!strcmp(name, "REKARINA_HDR_FLARE")) return "0";
-    if (!strcmp(name, "REKARINA_HDR_HUE")) return "100";
-    if (!strcmp(name, "REKARINA_HDR_GRADE")) return "100";
     if (!strcmp(name, "REKARINA_HDR_BLOOM")) return "50";
     if (!strcmp(name, "REKARINA_HDR_LOCAL_EXPOSURE")) return "50";
     if (!strcmp(name, "REKARINA_HDR_ADAPTATION_TARGET")) return "18";
@@ -65,6 +61,8 @@ const char *cfg_value(const char *name) {
 }
 double cfg_double(const char *name) { return strtod(cfg_value(name), NULL); }
 int cfg_bool(const char *name) { return strcmp(cfg_value(name), "0") != 0; }
+static CfgRenderValues render_values;
+const CfgRenderValues *cfg_render_values(void) { return &render_values; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
 VkCtx *vk_ctx(void) { return NULL; }
 void vk_queue_lock(void) {}
@@ -81,11 +79,12 @@ void rec_push(PFN_vkCmdPushDescriptorSetKHR fn, VkCommandBuffer cb, VkPipelineBi
 void plat_mutex_lock(PlatMutex *m) { (void)m; }
 void plat_mutex_unlock(PlatMutex *m) { (void)m; }
 
-GfxStats gfx_counters;
-uint32_t rt_trace;
-void renderer_mcp_tonemap(unsigned width, unsigned height) { (void)width; (void)height; }
-
 #include "../runtime/vk_hdr.c"
+
+GfxStats gfx_counters;
+#ifdef _WIN32
+void renderer_mcp_tonemap(unsigned width, unsigned height) { (void)width; (void)height; }
+#endif
 
 static int fails;
 #define CHECK(cond, msg) do { if (!(cond)) { fails++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)
@@ -97,26 +96,13 @@ static void check_output_overwrite(void) {
     gfx_counters.frames = 1;
     vk_hdr_record_output(21, image, 0x1000, GFX_OUTPUT_PQ, &original);
     vk_hdr_record_output(22, VK_NULL_HANDLE, 0x2000, GFX_OUTPUT_PQ, &original);
-    CHECK(vk_hdr_output_targets_pending(image, 0) && vk_hdr_output_targets_pending(VK_NULL_HANDLE, 0x2000) &&
-          !vk_hdr_output_targets_pending((VkImage)(uintptr_t)2, 0x3000),
-          "pending target match identifies recorded images and aliased addresses only");
     vk_hdr_output_overwrite(image, 0);
     CHECK(vk_hdr_written_output(21, 2, &result) == GFX_OUTPUT_UNSPECIFIED &&
           vk_hdr_written_output(22, 2, &result) == GFX_OUTPUT_PQ && result.valid && vk_hdr_output_pending(),
           "overwriting one image invalidates its PQ proof without clearing another image's proof");
     vk_hdr_output_overwrite(VK_NULL_HANDLE, 0x2000);
-    CHECK(!vk_hdr_output_pending() && !vk_hdr_output_pending_frame &&
-          vk_hdr_written_output(22, 2, &result) == GFX_OUTPUT_UNSPECIFIED,
+    CHECK(!vk_hdr_output_pending() && vk_hdr_written_output(22, 2, &result) == GFX_OUTPUT_UNSPECIFIED,
           "an alias write invalidates the last PQ proof at the same guest address");
-    rt_trace = 0;
-    vk_hdr_output_set_guest_pq(0);
-    CHECK(!vk_hdr_output_track_enabled(), "output proof tracking stays off for SDR and Host HDR without trace");
-    vk_hdr_output_set_guest_pq(1);
-    CHECK(vk_hdr_output_track_enabled(), "output proof tracking arms while Guest PQ is active");
-    vk_hdr_output_set_guest_pq(0);
-    rt_trace = RT_TRACE_GFX;
-    CHECK(vk_hdr_output_track_enabled(), "output proof tracking arms under RT_TRACE_GFX");
-    rt_trace = 0;
 }
 
 static void emit_str_op(SpvBuf *b, uint32_t op, uint32_t id, const char *s) {
@@ -136,8 +122,10 @@ static uint32_t fbits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 // shape: 1 = scene*gain (scalar stores), 2 = (scene*gain)*local_exp with interleaved scalar stores & func vars,
 //        3 = fma(scene, gain, color), 4 = fma(scene*gain, local_exp, color), 5 = fallback vector store,
 //        6 = translator FP16/NaN-sanitized output store (OpLoad site_var -> OpIsNan/FMax/FMin/Bitcast/Select -> OpStore),
-//        7 = non-ACES shader.
+//        7 = non-ACES shader, 8 = HDR expansion with scene bloom and direct gain,
+//        9 = pause scene (raw bloom sample and sanitized ACES output), 10 = same with mismatched bloom channels.
 static uint32_t *make_aces_spv(int shape, uint64_t *words_out) {
+    const int pause = shape == 9 || shape == 10;
     SpvBuf b = {0};
     uint32_t hdr[5] = {SPV_MAGIC, 0x00010500u, 0, 200, 0};
     spv_emit(&b, hdr, 5);
@@ -146,8 +134,8 @@ static uint32_t *make_aces_spv(int shape, uint64_t *words_out) {
     SPV_INS(&b, 14 /* OpMemoryModel */, 0, 1);
     // OpEntryPoint Fragment %4 "main" %30 %31 %34 (support_buffer %28 omitted intentionally to verify splice adds it)
     {
-        uint32_t ep[8] = {(8u << 16) | SPV_OP_ENTRY_POINT, SPV_EXEC_FRAGMENT, 4, 0x6e69616du /* "main" */, 0, 30, 31, 34};
-        spv_emit(&b, ep, 8);
+        uint32_t ep[9] = {((8u + pause) << 16) | SPV_OP_ENTRY_POINT, SPV_EXEC_FRAGMENT, 4, 0x6e69616du /* "main" */, 0, 30, 31, 34, 39};
+        spv_emit(&b, ep, 8 + pause);
     }
     SPV_INS(&b, 16 /* OpExecutionMode */, 4, 7 /* OriginUpperLeft */);
     emit_str_op(&b, SPV_OP_NAME, 28, "support_buffer");
@@ -163,6 +151,10 @@ static uint32_t *make_aces_spv(int shape, uint64_t *words_out) {
     SPV_INS(&b, SPV_OP_DECORATE, 34, SPV_DEC_BINDING, 1);
     SPV_INS(&b, SPV_OP_DECORATE, 30, 30 /* Location */, 0);
     SPV_INS(&b, SPV_OP_DECORATE, 31, 30 /* Location */, 0);
+    if (pause) {
+        SPV_INS(&b, SPV_OP_DECORATE, 39, SPV_DEC_SET, 0);
+        SPV_INS(&b, SPV_OP_DECORATE, 39, SPV_DEC_BINDING, 2);
+    }
 
     // Types
     SPV_INS(&b, SPV_OP_TYPE_VOID, 2);
@@ -187,6 +179,13 @@ static uint32_t *make_aces_spv(int shape, uint64_t *words_out) {
     SPV_INS(&b, SPV_OP_VARIABLE, 33, 34, SPV_SC_UNIFORM);
     SPV_INS(&b, SPV_OP_VARIABLE, 9, 30, SPV_SC_INPUT);
     SPV_INS(&b, SPV_OP_VARIABLE, 10, 31, SPV_SC_OUTPUT);
+    if (pause) {
+        SPV_INS(&b, SPV_OP_TYPE_VECTOR, 35, 6, 2);
+        SPV_INS(&b, 25 /* OpTypeImage */, 36, 6, 1 /* 2D */, 0, 0, 0, 1, 0);
+        SPV_INS(&b, 27 /* OpTypeSampledImage */, 37, 36);
+        SPV_INS(&b, SPV_OP_TYPE_POINTER, 38, 0 /* UniformConstant */, 37);
+        SPV_INS(&b, SPV_OP_VARIABLE, 38, 39, 0);
+    }
 
     // Constants
     SPV_INS(&b, SPV_OP_CONSTANT, 8, 40, 0);
@@ -203,6 +202,8 @@ static uint32_t *make_aces_spv(int shape, uint64_t *words_out) {
     SPV_INS(&b, SPV_OP_CONSTANT, 6, 57, fbits(0.25f));   // add_color
     SPV_INS(&b, SPV_OP_CONSTANT, 14, 58, 0u);
     SPV_INS(&b, SPV_OP_CONSTANT, 6, 59, fbits(65504.0f));
+    SPV_INS(&b, SPV_OP_CONSTANT, 6, 61, fbits(10000.0f));
+    SPV_INS(&b, SPV_OP_CONSTANT, 6, 62, fbits(-1.0f));
 
     // main()
     SPV_INS(&b, SPV_OP_FUNCTION, 2, 4, 0, 3);
@@ -222,12 +223,46 @@ static uint32_t *make_aces_spv(int shape, uint64_t *words_out) {
     SPV_INS(&b, SPV_OP_ACCESS_CHAIN, 12, p_gain, 34, 40, 42);
     SPV_INS(&b, SPV_OP_LOAD, 6, gain, p_gain);
 
+    uint32_t sample = 0;
+    if (pause) {
+        uint32_t coord = next++, sampler = next++;
+        sample = next++;
+        SPV_INS(&b, SPV_OP_VECTOR_SHUFFLE, 35, coord, in_v, in_v, 0, 1);
+        SPV_INS(&b, SPV_OP_LOAD, 37, sampler, 39);
+        SPV_INS(&b, SPV_OP_IMAGE_SAMPLE_IMPLICIT_LOD, 7, sample, sampler, coord);
+    }
+
+    if (shape == 11) {
+        for (int c = 0; c < 3; c++) {
+            uint32_t rgb = next++;
+            SPV_INS(&b, SPV_OP_COMPOSITE_EXTRACT, 6, rgb, in_v, (uint32_t)c);
+            SPV_INS(&b, SPV_OP_STORE, fvar[c], rgb);
+        }
+    }
     uint32_t cl[3];
     for (int c = 0; c < 3; c++) {
         uint32_t sc = next++;
         SPV_INS(&b, SPV_OP_COMPOSITE_EXTRACT, 6, sc, in_v, (uint32_t)c);
+        if (shape == 8 || pause) {
+            uint32_t low = next++, base = next++, mag = next++, log_mag = next++, power = next++, bloom = next++;
+            SPV_INS(&b, SPV_OP_EXT_INST, 6, low, 1, GLSL_FMAX, sc, 50);
+            SPV_INS(&b, SPV_OP_EXT_INST, 6, base, 1, GLSL_FMIN, low, 61);
+            if (pause) {
+                SPV_INS(&b, SPV_OP_COMPOSITE_EXTRACT, 6, bloom, sample, (uint32_t)(shape == 10 ? 0 : c));
+            } else {
+                SPV_INS(&b, SPV_OP_EXT_INST, 6, mag, 1, GLSL_FABS, sc);
+                SPV_INS(&b, SPV_OP_EXT_INST, 6, log_mag, 1, GLSL_LOG2, mag);
+                SPV_INS(&b, SPV_OP_FMUL, 6, power, log_mag, gain);
+                SPV_INS(&b, SPV_OP_EXT_INST, 6, bloom, 1, GLSL_EXP2, power);
+            }
+            sc = next++;
+            SPV_INS(&b, SPV_OP_FADD, 6, sc, base, bloom);
+        }
         uint32_t x = sc;
-        if (shape == 1 || shape == 6) {
+        if (shape == 11) {
+            x = next++;
+            SPV_INS(&b, SPV_OP_LOAD, 6, x, fvar[c]);
+        } else if (shape == 1 || shape == 6 || shape == 8 || pause) {
             x = next++;
             SPV_INS(&b, SPV_OP_FMUL, 6, x, sc, gain);
         } else if (shape == 2) {
@@ -257,7 +292,16 @@ static uint32_t *make_aces_spv(int shape, uint64_t *words_out) {
         SPV_INS(&b, SPV_OP_FDIV, 6, rcp, 51, den);
         SPV_INS(&b, SPV_OP_FMUL, 6, rat, num, rcp);
         SPV_INS(&b, SPV_OP_EXT_INST, 6, cl[c], 1, shape == 2 ? GLSL_NCLAMP : GLSL_FCLAMP, rat, 50, 51);
-        if (shape == 6) {
+        if (shape == 8) {
+            uint32_t inner = next++, outer = next++, expanded = next++, bounded = next++;
+            SPV_INS(&b, SPV_OP_EXT_INST, 6, inner, 1, GLSL_FMA, cl[c], gain, 62);
+            SPV_INS(&b, SPV_OP_EXT_INST, 6, outer, 1, GLSL_FMA, inner, gain, 51);
+            SPV_INS(&b, SPV_OP_FMUL, 6, expanded, outer, gain);
+            SPV_INS(&b, SPV_OP_EXT_INST, 6, bounded, 1, GLSL_FMAX, expanded, 50);
+            cl[c] = next++;
+            SPV_INS(&b, SPV_OP_EXT_INST, 6, cl[c], 1, GLSL_FMIN, bounded, gain);
+        }
+        if (shape == 6 || pause) {
             SPV_INS(&b, SPV_OP_STORE, cvar[c], cl[c]);
         } else if (shape != 5) {
             uint32_t po = next++;
@@ -265,7 +309,7 @@ static uint32_t *make_aces_spv(int shape, uint64_t *words_out) {
             SPV_INS(&b, SPV_OP_STORE, po, cl[c]);
         }
     }
-    if (shape == 6) {
+    if (shape == 6 || pause) {
         // Translator FP16/NaN sanitizer: AccessChain -> Load cvar -> IsNan/FMax/FMin/Bitcast/Select/Bitcast -> Store
         for (int c = 0; c < 3; c++) {
             uint32_t po = next++, ld = next++, nan = next++, mx = next++, mn = next++, bu = next++, sel = next++, bf = next++;
@@ -307,7 +351,14 @@ static void write_spv(const char *path, const uint32_t *w, uint64_t n) {
 int main(int argc, char **argv) {
     // Optional external-file mode: hdr_splice_check --file <in.spv> <out.spv> prints the result (2: exposure traced) and
     // each optional term traced in the shader.
-    if (argc == 4 && !strcmp(argv[1], "--file")) {
+    int mode = argc == 4 && !strcmp(argv[1], "--native-file") ? SPLICE_HDR_SCENE :
+               argc == 4 && !strcmp(argv[1], "--grade-file") ? SPLICE_VANILLA_GRADE :
+               argc == 4 && !strcmp(argv[1], "--effects-file") ? SPLICE_HDR_EFFECTS : SPLICE_ACES;
+    int aa_stage = argc == 4 && !strcmp(argv[1], "--aa-prep") ? 1 :
+                   argc == 4 && !strcmp(argv[1], "--aa-blend") ? 2 :
+                   argc == 4 && !strcmp(argv[1], "--aa-store") ? 3 :
+                   argc == 4 && !strcmp(argv[1], "--aa-mask") ? 4 : 0;
+    if (argc == 4 && (mode != SPLICE_ACES || aa_stage || !strcmp(argv[1], "--file"))) {
         FILE *f = fopen(argv[2], "rb");
         if (!f) return 2;
         fseek(f, 0, SEEK_END);
@@ -317,14 +368,17 @@ int main(int argc, char **argv) {
         if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(buf); return 2; }
         fclose(f);
         uint64_t words = (uint64_t)sz / 4;
-        SpliceTrace trace;
-        int r = tonemap_splice(&buf, &words, 1, &trace);
+        SpliceTrace trace = {0};
+        int r = aa_stage == 4 ? vk_aa_mask_splice(&buf, &words, 2) :
+                aa_stage ? vk_hdr_aa_splice(&buf, &words, aa_stage == 1 ? 1 : 2,
+                                            aa_stage == 1 ? 5 : aa_stage == 2 ? 6 : 18, aa_stage == 3) :
+                tonemap_splice(&buf, &words, mode == SPLICE_ACES || mode == SPLICE_HDR_SCENE, mode, &trace);
         if (r > 0) write_spv(argv[3], buf, words);
         free(buf);
         printf("%d%s%s%s\n", r, r > 0 && trace.bloom ? " bloom" : "",
                r > 0 && trace.local_exposure ? " local-exposure" : "",
                r > 0 && trace.meter_binding ? " eye-adaptation" : "");
-        return r < 0 ? 1 : 0;
+        return r < 0 || (aa_stage == 4 && !r) ? 1 : 0;
     }
     const char *out_dir = argc > 1 ? argv[1] : NULL;
     check_output_overwrite();
@@ -343,13 +397,29 @@ int main(int argc, char **argv) {
     vk_hdr_record_output(17, VK_NULL_HANDLE, 0x1000, GFX_OUTPUT_PQ, &b);
     CHECK(vk_hdr_written_output(17, 12, &current) == GFX_OUTPUT_PQ && current.row[0][0] == 300 && queued.row[0][0] == 203,
           "a new writer cannot change a transform copied to the present queue");
+    render_values.renodx_flags = CFG_HDR_RENODX_SCENE;
+    CHECK(!vk_hdr_renodx_scene(), "RenoDX scene mapping waits for the HDR swapchain");
+    vk_hdr_set_active(1);
+    test_cfg_set("REKARINA_HDR_TONEMAP", "vanilla");
+    render_values.renodx_flags = CFG_HDR_RENODX_EFFECTS;
+    CHECK(vk_hdr_renodx_effects() && !vk_hdr_renodx_scene(), "Vanilla effects do not enable signed scene AA");
+    test_cfg_set("REKARINA_HDR_TONEMAP", "psychov35");
+    render_values.renodx_flags = CFG_HDR_RENODX_SCENE;
+    CHECK(vk_hdr_renodx_scene(), "PsychoV35 enables signed scene mapping with the HDR swapchain active");
+    CHECK(vk_hdr_wanted() && !vk_hdr_native(), "HDR PsychoV35 selects the signed compositor");
+    test_cfg_set("REKARINA_HDR_TONEMAP", "vanilla");
+    CHECK(vk_hdr_wanted() && vk_hdr_native(), "changing only the HDR tonemapper selects the native compositor");
+    test_cfg_set("REKARINA_HDR", "0");
+    CHECK(!vk_hdr_wanted() && !vk_hdr_native(), "the HDR tonemapper does not turn HDR on");
+    test_cfg_set("REKARINA_HDR", "1");
+    render_values.renodx_flags = 0;
     // 1. Test tonemap_splice across all 6 ACES shapes (including NaN-sanitized output) + non-ACES shader
     for (int shape = 1; shape <= 7; shape++) {
         uint64_t n = 0;
         uint32_t *spv = make_aces_spv(shape, &n);
         uint64_t orig_n = n;
         SpliceTrace trace;
-        int r = tonemap_splice(&spv, &n, 1, &trace);
+        int r = tonemap_splice(&spv, &n, 1, SPLICE_ACES, &trace);
         if (shape <= 4 || shape == 6) CHECK(r == 2 && n > orig_n, "exposure-traced ACES shape spliced");
         else if (shape == 5) CHECK(r == 1 && n > orig_n, "fallback vector-store ACES shape spliced");
         else CHECK(r == 0 && n == orig_n, "non-ACES shader untouched");
@@ -368,7 +438,7 @@ int main(int argc, char **argv) {
     uint64_t no_meter_words;
     uint32_t *no_meter = make_aces_spv(2, &no_meter_words);
     SpliceTrace no_meter_trace;
-    CHECK(tonemap_splice(&no_meter, &no_meter_words, 0, &no_meter_trace) == 2 && !no_meter_trace.meter_binding,
+    CHECK(tonemap_splice(&no_meter, &no_meter_words, 0, SPLICE_ACES, &no_meter_trace) == 2 && !no_meter_trace.meter_binding,
           "unsupported fragment stores keep HDR and local exposure");
     if (out_dir) {
         char path[256];
@@ -377,6 +447,48 @@ int main(int argc, char **argv) {
     }
     free(no_meter);
 
+    uint64_t grade_words;
+    uint32_t *grade = make_aces_spv(11, &grade_words);
+    SpliceTrace grade_trace;
+    CHECK(tonemap_splice(&grade, &grade_words, 0, SPLICE_VANILLA_GRADE, &grade_trace) > 0 && !grade_trace.meter_binding,
+          "Vanilla grading can replace the ACES fit without installing a second tonemapper or meter");
+    if (out_dir) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/spliced_vanilla_grade.spv", out_dir);
+        write_spv(path, grade, grade_words);
+    }
+    free(grade);
+
+    uint64_t direct_words;
+    uint32_t *direct = make_aces_spv(8, &direct_words);
+    SpliceTrace direct_trace;
+    CHECK(tonemap_splice(&direct, &direct_words, 1, SPLICE_HDR_SCENE, &direct_trace) == 2 &&
+          direct_trace.bloom && !direct_trace.local_exposure && direct_trace.meter_binding,
+          "HDR scene with direct gain keeps bloom and eye adaptation without a local-exposure term");
+    if (out_dir) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/spliced_hdr_direct.spv", out_dir);
+        write_spv(path, direct, direct_words);
+    }
+    free(direct);
+
+    for (int shape = 9; shape <= 10; shape++) {
+        uint64_t words;
+        uint32_t *spv = make_aces_spv(shape, &words);
+        SpliceTrace trace;
+        int result = tonemap_splice(&spv, &words, 1, SPLICE_HDR_SCENE, &trace);
+        if (shape == 9) {
+            CHECK(result == 2 && trace.bloom && !trace.local_exposure && !trace.meter_binding,
+                  "pause scene applies the HDR mapper and bloom without metering gameplay exposure");
+            if (out_dir && result > 0) {
+                char path[256];
+                snprintf(path, sizeof path, "%s/spliced_hdr_pause.spv", out_dir);
+                write_spv(path, spv, words);
+            }
+        } else CHECK(result == 0, "plain ACES output with unrelated bloom channels is not replaced");
+        free(spv);
+    }
+
     // 2. Test vk_hdr_support parameter packing and SDR passthrough
     test_cfg_reset();
     float sup[4 * VK_HDR_PARAMS];
@@ -384,17 +496,58 @@ int main(int argc, char **argv) {
     vk_hdr_support(sup);
     CHECK(sup[3] == -1.0f, "SDR swapchain sets p0.w = -1 (vanilla passthrough)");
     CHECK(sup[20] == 1.0f, "SDR swapchain keeps the game's bloom (p5.x = 1)");
+    test_cfg_set("REKARINA_HDR", "0");
+    CHECK(!vk_hdr_sdr_scene() && !vk_hdr_scene_grade(), "SDR defaults to the unmodified Vanilla shader");
+    test_cfg_set("REKARINA_HDR_EXPOSURE", "75");
+    CHECK(vk_hdr_scene_grade() && !vk_hdr_sdr_scene(), "nonneutral grade is supported with the Vanilla mapper");
+    test_cfg_set("REKARINA_SDR_TONEMAP", "psychov35");
+    test_cfg_set("REKARINA_HDR_GAMMA", "2.4");
+    vk_hdr_support(sup);
+    CHECK(vk_hdr_sdr_scene() && sup[3] == 8.0f && sup[0] == 203.0f && sup[1] == 203.0f && sup[4] == 0.75f,
+          "SDR PsychoV35 uses equal peak and diffuse white and shared exposure");
+    CHECK(sup[14] == 0.0f, "SDR PsychoV35 ignores the saved HDR EOTF emulation");
+    test_cfg_set("REKARINA_HDR_BLOOM", "25");
+    vk_hdr_support(sup);
+    CHECK(vk_hdr_renodx_effects() && sup[20] == 0.5f, "SDR PsychoV35 receives the shared bloom setting");
+    test_cfg_set("REKARINA_SDR_TONEMAP", "vanilla");
+    vk_hdr_support(sup);
+    CHECK(!vk_hdr_sdr_scene() && vk_hdr_renodx_effects() && sup[20] == 0.5f,
+          "SDR Vanilla can adjust bloom without switching tonemappers");
+    test_cfg_set("REKARINA_HDR", "1");
+    test_cfg_set("REKARINA_HDR_TONEMAP", "vanilla");
+    vk_hdr_set_active(1);
+    vk_hdr_support(sup);
+    CHECK(!vk_hdr_sdr_scene() && sup[3] == 0.0f && sup[4] == 0.75f,
+          "HDR remembers a separate mapper and consumes the same grade");
+    test_cfg_reset();
     vk_hdr_set_active(1);
     vk_hdr_support(sup);
     CHECK(sup[0] == 1000.0f && sup[1] == 203.0f && sup[2] == 203.0f && sup[3] == 9.0f, "PsychoV35 defaults");
+    test_cfg_set("REKARINA_HDR_UI_NITS", "300");
+    vk_hdr_support(sup);
+    CHECK(sup[2] == sup[1], "menu brightness does not rescale the guest scene");
     CHECK(sup[4] == 1.0f && sup[5] == 1.0f && sup[6] == 1.0f && sup[7] == 1.0f && sup[8] == 1.0f, "neutral grading");
-    CHECK(sup[14] == 1.0f && sup[15] == 1.0f && sup[16] == 0.5f && sup[17] == 1.0f && sup[18] == 1.0f, "PsychoV35 flags");
+    test_cfg_set("REKARINA_HDR_SATURATION", "0");
+    vk_hdr_support(sup);
+    CHECK(sup[8] == 0.0f, "zero saturation reaches the mapper as zero purity");
+    test_cfg_set("REKARINA_HDR_SATURATION", "50");
+    CHECK(sup[14] == 0.0f && sup[15] == 1.0f && sup[16] == 0.5f && sup[17] == 1.0f && sup[18] == 1.0f, "PsychoV35 flags");
+    CHECK(nits().ui_eotf == 1.0f, "UI EOTF defaults to 2.2 while Render EOTF is off");
+    test_cfg_set("REKARINA_HDR_UI_EOTF", "2.4");
+    vk_hdr_support(sup);
+    CHECK(nits().ui_eotf == 2.0f && sup[14] == 0.0f, "UI EOTF does not change the render shader");
+    test_cfg_set("REKARINA_HDR_UI_EOTF", "off");
     CHECK(sup[20] == 1.0f, "bloom 50 is the game's (p5.x = 1)");
+    CHECK(sup[21] == 0.0f, "PsychoV35 local exposure defaults to off");
     test_cfg_set("REKARINA_HDR_BLOOM", "25");
     test_cfg_set("REKARINA_HDR_LOCAL_EXPOSURE", "0");
     vk_hdr_support(sup);
     CHECK(sup[20] == 0.5f, "bloom 25 halves the game's (p5.x = 0.5)");
-    CHECK(sup[21] == 1.0f, "PsychoV35 does not use local exposure control");
+    CHECK(sup[21] == 0.0f, "PsychoV35 local exposure off");
+    test_cfg_set("REKARINA_HDR_LOCAL_EXPOSURE", "100");
+    vk_hdr_support(sup);
+    CHECK(sup[21] == 0.0f, "PsychoV35 ignores stored Vanilla local exposure strength");
+    test_cfg_set("REKARINA_HDR_LOCAL_EXPOSURE", "0");
     test_cfg_set("REKARINA_HDR_MIDGRAY", "adaptation");
     vk_hdr_support(sup);
     CHECK(sup[17] == 2.0f, "PsychoV35 activates the eye adaptation meter");
@@ -402,19 +555,19 @@ int main(int argc, char **argv) {
     CHECK(settings.adaptation_target == 0.18f && settings.adaptation_min == 0.0625f && settings.adaptation_max == 4.0f,
           "adaptation target and stop limits");
 
-    test_cfg_set("REKARINA_HDR_TONEMAP", "renodrt");
     test_cfg_set("REKARINA_HDR_GAMMA", "2.4");
     test_cfg_set("REKARINA_HDR_EXPOSURE", "120");
     vk_hdr_support(sup);
-    CHECK(sup[3] == 3.0f && sup[14] == 2.0f && fabsf(sup[4] - 1.2f) < 1e-5f, "RenoDRT + gamma 2.4 + exposure");
-    CHECK(sup[21] == 0.0f, "RenoDRT local exposure off");
-    CHECK(sup[17] == 1.0f, "RenoDRT ignores the adaptive PsychoV35 anchor");
+    CHECK(sup[3] == 9.0f && sup[14] == 2.0f && fabsf(sup[4] - 1.2f) < 1e-5f, "PsychoV35 + gamma 2.4 + exposure");
+    CHECK(nits().ui_eotf == 0.0f, "Render EOTF does not change the UI decode");
 
     test_cfg_set("REKARINA_HDR_TONEMAP", "vanilla");
     test_cfg_set("REKARINA_HDR_GAMMA", "off");
+    vk_hdr_support(sup);
+    CHECK(sup[17] != 2.0f && sup[21] == 0.0f, "Vanilla defaults to no local exposure or eye adaptation");
     test_cfg_set("REKARINA_HDR_LOCAL_EXPOSURE", "100");
     vk_hdr_support(sup);
-    CHECK(sup[3] == 0.0f && sup[14] == 0.0f, "Vanilla + gamma off");
+    CHECK(sup[3] == 0.0f && sup[14] == HDR_GAMMA_22, "Vanilla HDR keeps the native EOTF");
     CHECK(sup[21] == 2.0f, "Vanilla local exposure doubles the correction in stops");
     vk_hdr_set_active(0);
     vk_hdr_support(sup);
@@ -424,6 +577,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "hdr_splice_check: %d failures\n", fails);
         return 1;
     }
-    printf("hdr_splice_check: passed (6 shader shapes + parameter packing)\n");
+    printf("hdr_splice_check: passed (shader splices and parameter packing)\n");
     return 0;
 }

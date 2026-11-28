@@ -27,6 +27,8 @@ int vk_reflex_swapchain_next(VkSwapchainCreateInfoKHR *create_info, VkSwapchainL
 int vk_reflex_swapchain_stale(void);   // 1 when REKARINA_REFLEX toggled Off <-> On/Boost since swapchain creation
 void vk_reflex_swapchain_created(VkSwapchainKHR swapchain, int latency_enabled);
 void vk_reflex_swapchain_destroyed(void);
+void vk_reflex_wsi_lock(void);
+void vk_reflex_wsi_unlock(void);
 
 // Per-frame pacing, submission tagging, and latency markers:
 void vk_reflex_game_present(void);      // guest frame boundary (vk_backend.c vk_be_present)

@@ -40,6 +40,7 @@ typedef struct VkCtx {
         has_calibrated,                     // VK_KHR/EXT_calibrated_timestamps (GPU idle split in the perf line)
         has_hdr_metadata,                   // VK_EXT_hdr_metadata (vk_hdr.c vk_hdr_metadata)
         has_fragment_stores,                // fragmentStoresAndAtomics (vk_hdr.c, eye adaptation meter)
+        has_extended_storage_formats,      // shaderStorageImageExtendedFormats
         has_map_placed,                     // VK_EXT_map_memory_placed with memoryMapPlaced and memoryUnmapReserve (Linux: driver-backed guest memory)
         has_atomic_float,                   // VK_EXT_shader_atomic_float with shaderBufferFloat32AtomicAdd
         has_present_timing,                 // DEBUG-PRESENTTIMING: VK_EXT_present_timing + VK_KHR_present_id2 (REKARINA_PRESENT_TIMING=1)
@@ -123,15 +124,13 @@ void vk_crumbs_report(void);         // logs the two codes and what they name
 // checkpoints (the extension is enabled at device creation); 0, none.
 #define VK_PASS_MARKS 4096   // power of two
 enum { VK_MARK_PASS = 1, VK_MARK_DISPATCH, VK_MARK_PROLOGUE, VK_MARK_WRITEBACK, VK_MARK_MERGE, VK_MARK_WBCOPY, VK_MARK_UI_CAPTURE };   // the last two: mirror copies in and out
-// An image as a pass mark keeps it: a copy taken while the pass is recorded, since the record it came from may be gone
-// by the time a loss is reported.
 enum { VK_MARK_IMG_SET = 1, VK_MARK_IMG_BOUND = 2, VK_MARK_IMG_MIRRORED = 4, VK_MARK_IMG_GPU_OWNED = 8, VK_MARK_IMG_STORAGE = 16 };
 typedef struct {
-    uint64_t addr;                      // storage GPU address
+    uint64_t addr;
     uint32_t w, h, levels, layers;
-    uint32_t serial;                    // VkTexImage.serial: images are numbered as they are made
+    uint32_t serial;
     VkFormat format;
-    uint8_t flags;                      // VK_MARK_IMG_*: BOUND = lies in the game's pool memory (VkTexImage.bound)
+    uint8_t flags;                      // VK_MARK_IMG_*
 } VkMarkImage;
 typedef struct {
     uint32_t id;                        // the mark this record belongs to (0: never written)
@@ -183,15 +182,20 @@ void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, in
 // vk_present_image split in two: vk_present_blit submits the blit and leaves the present waiting, vk_present_flip
 // queues it. The next blit or a swapchain rebuild queues a waiting present first.
 typedef struct { float row[3][4]; int valid; } VkGuestPq;
-int vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], GfxOutputEncoding encoding); // nonzero: DLSS-G inputs must survive the flip
+int vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4],
+                    const VkGuestPq *pq, const char *nvidia_scene_aa); // nonzero: DLSS-G inputs must survive the flip
 // FSR 1 on the present (vk_fsr.c): records EASU (+ RCAS) of src's crop rectangle {x, y, w, h} into the rectangle out
 // {x, y, w, h} of dst, a swapchain image in TRANSFER_DST; src is in GENERAL and fmt its format. 0 = nothing recorded
 // (the setting says bilinear, no upscale is needed, or FSR is not available): the caller blits.
 int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int crop[4],
                   VkImage dst, const int out[4]);
-// FSR 1 on the 3D scene (vk_fsr.c, REKARINA_TAA = fsr1): records the scaling of src (the light target, w x h, GENERAL)
-// into out (an RGBA16F storage view, ow x oh, GENERAL), still linear light. 1 = recorded.
+#ifdef GAME_OOT
+int vk_fsr_tonemapped(VkCommandBuffer cb, VkImageView src, uint32_t w, uint32_t h, VkImage dst, VkFormat format,
+                      uint32_t ow, uint32_t oh, int hdr_bt2020);
+int vk_scene_rcas(VkCommandBuffer cb, VkImage image, VkImageView view, VkFormat format, uint32_t w, uint32_t h, int strength);
+#else
 int vk_fsr_scene(VkCommandBuffer cb, VkImageView src, uint32_t w, uint32_t h, VkImageView out, uint32_t ow, uint32_t oh);
+#endif
 void vk_fsr_release(void);   // before the device goes away
 // Colour adjustment on the present (vk_color.c): with REKARINA_COLOR_* away from their defaults, records a pass that writes
 // src's crop rectangle {x, y, w, h}, adjusted, into an RGBA16F image of that size in GENERAL and returns it (the caller
@@ -202,18 +206,19 @@ void vk_color_release(void);   // before the device goes away
 // and returns 1 when a profile is set (logged per picture size); vk_color_not_drawn_hdr says once when it could not.
 int vk_color_hdr(float adj[4], const int crop[4]);
 void vk_color_not_drawn_hdr(void);
-// HDR output (vk_hdr.c). vk_hdr_armed: the HDR path is set up for this run (extensions, spliced tonemap, support
-// buffer). vk_hdr_wanted: HDR is requested now (follows the menu live on OoT when armed). vk_hdr_native /
-// vk_hdr_native_picture: the game's own PQ Rec. 2020 output (REKARINA_HDR=native). vk_hdr_surface_format: the HDR10
-// surface format when wanted and offered (1). vk_hdr_set_active: gfx_present.c says whether the swapchain is HDR10
-// (vk_hdr_active). vk_hdr_encode: like vk_color_record, src's crop as PQ code values (RGBA16F, crop {0, 0, w, h}).
+// HDR output (vk_hdr.c). vk_hdr_armed enables the Vulkan extensions and tone-map support. vk_hdr_wanted follows the
+// live mode on OoT. vk_hdr_native selects the guest scene mapper; both OoT HDR modes use the guest's PQ output.
+// vk_hdr_surface_format selects the HDR10 surface format for TotK. vk_hdr_set_active records the swapchain encoding.
+// vk_hdr_encode returns src's crop as PQ code values (RGBA16F, crop {0, 0, w, h}).
 // vk_hdr_ui_target / vk_hdr_ui_compose: the in-game menu's RGBA8 target, then blended onto the swapchain image.
 // vk_hdr_to_srgb8: 10-bit PQ pixels to sRGB bytes. vk_hdr_images_release: drops present pass images when leaving HDR.
 int vk_hdr_armed(void);
 int vk_hdr_native(void);
+#ifdef GAME_OOT
+int vk_hdr_renodx_scene(void);
+#endif
 int vk_hdr_native_picture(VkFormat fmt);
 int vk_hdr_wanted(void);
-int vk_hdr_needs_restart(void);
 void vk_hdr_off(void);   // probes that read back 8-bit swapchain pixels: SDR whatever the setting
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out);
 void vk_hdr_metadata(VkSwapchainKHR sc, int new_sc);
@@ -221,11 +226,7 @@ void vk_hdr_set_active(int on);
 int vk_hdr_active(void);
 #ifdef GAME_OOT
 int gfx_hdr_surface_capable(void);
-extern uint64_t vk_hdr_output_pending_frame;
 int vk_hdr_output_pending(void);
-int vk_hdr_output_track_enabled(void);
-void vk_hdr_output_set_guest_pq(int on);
-int vk_hdr_output_targets_pending(VkImage image, uint64_t address);
 void vk_hdr_output_overwrite(VkImage image, uint64_t address);
 void vk_hdr_record_output(uint32_t serial, VkImage image, uint64_t address, GfxOutputEncoding encoding, const VkGuestPq *pq);
 GfxOutputEncoding vk_hdr_written_output(uint32_t serial, uint64_t frame, VkGuestPq *pq);
@@ -245,6 +246,9 @@ void vk_hdr_support(float out[4 * VK_HDR_PARAMS]);
 #ifdef GAME_OOT
 // Eye adaptation is available when the Vulkan device can atomically write the fragment meter.
 int vk_hdr_adaptation_supported(void);
+int vk_hdr_renodx_effects(void);
+int vk_hdr_sdr_scene(void);
+int vk_hdr_scene_grade(void);
 // Binds the HDR eye adaptation meter for a draw. The caller binds its zero buffer if no meter was acquired.
 struct VkExec;
 VkDescriptorBufferInfo vk_hdr_meter_bind(struct VkExec *ex);
@@ -484,6 +488,8 @@ int vk_exec_held(void);
 void vk_replay_flush_held(void);   // vk_backend.c: asynchronous replay: an empty submission that records every held rest, waited for
 int gfx_replay_async(void);
 void vk_sync_submits_drain(void);   // the driver has every batch the replay queued (vk_queue_lock calls it)
+uint64_t vk_sync_submit_upload(VkCommandBuffer cb, VkFence fence);   // 0 if the caller must submit directly
+int vk_sync_upload_submitted(uint64_t ticket, int wait);
 uint64_t vk_sync_results_done(void);
 int vk_sync_results_wait(uint64_t value, uint64_t timeout_ns);
 void vk_mem_reap_drain(void);   // returns once every object handed to the reaper thread is destroyed
@@ -602,6 +608,10 @@ typedef struct {
     uint32_t serial;               // new for every image this record is given (vk_texture_image_serial): the view cache keys
                                    // by it with the handle, as Vulkan hands a destroyed image's handle to a later image
 } VkTexImage;
+#ifdef GAME_OOT
+int vk_hdr_ui_guest_compose(VkCommandBuffer cb, const VkTexImage *source, VkImageView target,
+                            int preview[4], const VkGuestPq *pq);
+#endif
 uint32_t vk_texture_image_serial(void);   // vk_texture.c: the next image serial (never 0)
 // vk_texture.c: REKARINA_SHADOW_SCALE as the shadow maps are made with it, 1 to 4 (auto decided for the card), read
 // once with the device up
@@ -834,6 +844,7 @@ typedef struct {
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
     int pool;                              // the layout has the texture pool's set at GFX_POOL_SET (vk_texpool.c)
+    int mesh_standin;                      // the fast-linked mesh pipeline has no dynamic shading rate
     // pipe_prep (vk_exec_draw.c), once per info: bindings [set_lo, set_hi) per set, and whether a set has no template
     uint8_t prep, need_w;
     uint32_t set_lo[2], set_hi[2];
@@ -912,6 +923,7 @@ void vk_pipeline_draw_mesh_indirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize
 // write masks and references; vertex buffers with vkCmdBindVertexBuffers2 (strides NULL when
 // vk_pipeline_vertex_input_dynamic(), else from VkPipeState.vstream).
 void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s);
+void vk_pipeline_set_dynamic_no_assembly(VkCommandBuffer cb, const VkPipeState *s);
 int vk_pipeline_vertex_input_dynamic(void);    // 1: vertex input is VK_EXT_vertex_input_dynamic_state
 // Translator answers from the bound state: attr_type from the vertex attribute formats (vs), frag_out_type from the
 // colour target formats (fs). Other fields are left as they are; either pointer may be NULL.

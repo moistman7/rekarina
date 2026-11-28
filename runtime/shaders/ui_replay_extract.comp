@@ -2,17 +2,26 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D accumulated;
 layout(set = 0, binding = 1, r16f) writeonly uniform image2D mask;
-layout(push_constant) uniform Fit { ivec4 crop; ivec4 destination; } fit;
+layout(set = 0, binding = 2) uniform sampler2D overlay;
+layout(push_constant) uniform Fit { ivec4 crop; ivec4 destination; ivec4 preview; int inputs; } fit;
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, imageSize(mask)))) return;
     ivec2 local = pixel - fit.destination.xy;
-    float alpha = 0.0;
-    if (all(greaterThanEqual(local, ivec2(0))) && all(lessThan(local, fit.destination.zw))) {
+    bool inside = all(greaterThanEqual(local, ivec2(0))) && all(lessThan(local, fit.destination.zw));
+    float alpha = 0.0, menu = 0.0;
+    if (inside && (fit.inputs & 5) != 0) {
         vec2 lo = vec2(fit.crop.xy), hi = lo + vec2(fit.crop.zw);
         vec2 source = lo + (vec2(local) + 0.5) * vec2(fit.crop.zw) / vec2(fit.destination.zw);
         source = clamp(source, lo + 0.5, hi - 0.5);
-        alpha = textureLod(accumulated, source / vec2(textureSize(accumulated, 0)), 0.0).a;
+        if ((fit.inputs & 1) != 0)
+            alpha = textureLod(accumulated, source / vec2(textureSize(accumulated, 0)), 0.0).a;
+        if ((fit.inputs & 4) != 0) {
+            menu = textureLod(overlay, source / vec2(textureSize(overlay, 0)), 0.0).a;
+            if (all(greaterThanEqual(source, vec2(fit.preview.xy))) &&
+                all(lessThan(source, vec2(fit.preview.xy + fit.preview.zw)))) menu = 1.0;
+        }
     }
-    imageStore(mask, pixel, vec4(alpha));
+    if ((fit.inputs & 6) == 2) menu = texelFetch(overlay, pixel, 0).a;
+    imageStore(mask, pixel, vec4(menu + alpha * (1.0 - menu)));
 }

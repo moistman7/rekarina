@@ -10,9 +10,9 @@
 // submission takes the recursive queue lock (vk_queue_lock). The swapchain is rebuilt lazily: a resize only marks it
 // dirty (gfx_window_mark_dirty), the next present (or gfx_window_resize) rebuilds it.
 //
-// The in-game menu (ui/menu.h) draws over the game image in the present's command buffer, after the blit. The window's
-// size and fullscreen state are the settings REKARINA_WINDOW_SIZE and REKARINA_FULLSCREEN, which the back end applies at start
-// and whenever a cfg_set changes them (window_settings_live -> gfx_window_apply_settings).
+// The in-game menu (ui/menu.h) normally draws over the present blit. OoT's checked output draw can instead sample
+// a private picture with the menu blended in before encoding. Window size and fullscreen settings are applied at start
+// and when they change (window_settings_live -> gfx_window_apply_settings).
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,13 +30,11 @@
 #include "ui/menu.h"
 #include "vk.h"
 #include "vk_dlaa.h"
+#include "vk_exec.h"
 #include "vk_fg.h"
 #include "vk_dlssg.h"
 #include "vk_reflex.h"
-#ifdef GAME_OOT
-#include "vk_ffx.h"
 #include "vk_present_format.h"
-#endif
 #include "renderer_mcp.h"
 
 #define FRAMES 2
@@ -208,16 +206,13 @@ static PlatRMutex g_pl;
 static VkSwapchainKHR g_sc;
 static VkFormat g_sc_fmt;
 static int g_sc_hdr;                        // HDR10 (REKARINA_HDR, vk_hdr.c): PQ code values in Rec. 2020
-static int g_sc_hdr_wanted;                 // vk_hdr_wanted() when the swapchain was built (for live HDR toggles)
 #ifdef GAME_OOT
+static VkFormat g_output_format, g_sc_request_format;
 static int32_t g_surface_pq;
-static GfxOutputEncoding g_output_request, g_output_failed_request;
-static VkFormat g_output_format, g_sc_request_format, g_output_failed_format;
-
-static int guest_output_controls_swapchain(void) {
-    return vk_hdr_native() || g_output_request == GFX_OUTPUT_PQ;
-}
-int gfx_hdr_surface_capable(void) { return __atomic_load_n(&g_surface_pq, __ATOMIC_ACQUIRE); }
+int gfx_hdr_surface_capable(void) { return plat_cas32(&g_surface_pq, 0, 0); }
+void ns2_hdr_capability_changed(void);
+#else
+static int g_sc_hdr_wanted;
 #endif
 static VkExtent2D g_sc_ext;
 static int g_scaler;                        // the last present: 0 the game image 1:1, 1 scaled by the blit, 2 by FSR
@@ -350,12 +345,14 @@ static void window_settings_live(void) {
         snprintf(present, sizeof present, "%s", e);
         if (started) plat_xchg32(&g_dirty, 1);
     }
-    if (started && vk_hdr_wanted() != g_sc_hdr_wanted) plat_xchg32(&g_dirty, 1);
 #ifdef GAME_OOT
+    ns2_hdr_capability_changed();
     static int fg_wanted = -1;
     int want_fg = vk_fg_wanted();
     if (started && want_fg != fg_wanted) plat_xchg32(&g_dirty, 1);
     fg_wanted = want_fg;
+#else
+    if (started && vk_hdr_wanted() != g_sc_hdr_wanted) plat_xchg32(&g_dirty, 1);
 #endif
     vk_dlssg_reflex_sync();
     if (started && vk_reflex_swapchain_stale()) plat_xchg32(&g_dirty, 1);
@@ -455,7 +452,10 @@ static void pt_collect(VkDevice d) {
     VkPastPresentationTimingInfoEXT in = {.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT, .swapchain = g_sc};
     VkPastPresentationTimingPropertiesEXT out = {.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT,
                                                   .presentationTimingCount = 16, .pPresentationTimings = pt};
-    if (get(d, &in, &out) < 0) return;
+    vk_reflex_wsi_lock();
+    VkResult r = get(d, &in, &out);
+    vk_reflex_wsi_unlock();
+    if (r < 0) return;
     for (uint32_t i = 0; i < out.presentationTimingCount && i < 16; i++)
         if (pt[i].reportComplete && pt[i].presentStageCount && st[i].time)
             pacelog_mark(PL_VIS, pt[i].presentId, pt_qpc ? plat_scaled(pt_scale, st[i].time) : st[i].time);
@@ -486,8 +486,14 @@ static void flip_locked(void) {
     FT(FT_NOTE, 1, 0, 0);
     vk_queue_lock();
     vk_drv_urgent(1);
-    VkResult r = dlssg_sc ? vk_dlssg_present(vk_ctx()->gfx_queue, &pi)
-               : fg_sc ? vk_fg_present(&pi) : vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
+    VkResult r;
+    if (dlssg_sc) r = vk_dlssg_present(vk_ctx()->gfx_queue, &pi);
+    else if (fg_sc) r = vk_fg_present(&pi);
+    else {
+        vk_reflex_wsi_lock();
+        r = vkQueuePresentKHR(vk_ctx()->gfx_queue, &pi);
+        vk_reflex_wsi_unlock();
+    }
     vk_drv_urgent(-1);
     vk_queue_unlock();
     if (!dlssg_sc && !fg_sc) vk_reflex_present_end(rpid_val);
@@ -497,6 +503,16 @@ static void flip_locked(void) {
     if (r == VK_SUCCESS) gfx_window_presented();
     if (timed && r >= 0) pt_collect(vk_ctx()->device);   // DEBUG-PRESENTTIMING
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
+}
+
+static VkResult acquire_locked(VkDevice device, VkSemaphore ready, uint32_t *index) {
+    const uint64_t timeout = 1000000000ull;
+    if (vk_fg_swapchain()) return vk_fg_acquire(g_sc, timeout, ready, index);
+    if (vk_dlssg_swapchain_ready()) return vk_dlssg_acquire(device, g_sc, timeout, ready, index);
+    vk_reflex_wsi_lock();
+    VkResult r = vkAcquireNextImageKHR(device, g_sc, timeout, ready, VK_NULL_HANDLE, index);
+    vk_reflex_wsi_unlock();
+    return r;
 }
 
 static void free_capture(void) {
@@ -550,30 +566,26 @@ static int create_swapchain(void) {
     if (nf > 64) nf = 64;
     VkResult formats_result = vkGetPhysicalDeviceSurfaceFormatsKHR(c->phys, g_surface, &nf, fmts);
     if ((formats_result != VK_SUCCESS && formats_result != VK_INCOMPLETE) || !nf) return 0;
-    // UNORM: the blit writes the bytes the game wrote (no sRGB encode). REKARINA_HDR: HDR10 when the surface offers it.
+    // UNORM preserves the output shader's already encoded values.
     VkSurfaceFormatKHR sf = fmts[0];
 #ifdef GAME_OOT
     VkSurfaceFormatKHR pq;
     int capable = vk_present_surface_format(fmts, nf, VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_HDR10_ST2084_EXT, &pq);
     int previous_capability = plat_xchg32(&g_surface_pq, capable);
-    if (previous_capability != capable && vk_hdr_native())
-        oe_push_message(OE_MSG_OPERATION_MODE_CHANGED);
     if ((rt_trace & RT_TRACE_GFX) && previous_capability != capable)
         rt_log("gfx: HDR10 surface capability: %s", capable ? "available" : "unavailable");
-    int hdr, found;
-    if (guest_output_controls_swapchain()) {
-        hdr = g_output_request == GFX_OUTPUT_PQ;
-        VkColorSpaceKHR encoding = hdr ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-        if (!vk_present_surface_format(fmts, nf, g_output_format, encoding, &sf)) return 0;
-        found = 1;
-    } else hdr = found = vk_hdr_surface_format(fmts, nf, &sf);
+    ns2_hdr_capability_changed();
+    // OoT 1.1.1 changes the window from RGBA8 in SDR to RGB10A2 in HDR10.
+    int hdr = g_output_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    VkColorSpaceKHR encoding = hdr ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    if (!vk_present_surface_format(fmts, nf, g_output_format, encoding, &sf)) return 0;
 #else
     int hdr = vk_hdr_surface_format(fmts, nf, &sf), found = hdr;
-#endif
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
     for (uint32_t i = 0; i < nf && !found; i++)
         if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; found = 1; }
+#endif
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
@@ -581,6 +593,7 @@ static int create_swapchain(void) {
     const int had_fg = vk_fg_swapchain();
     int want_fg = vk_fg_wanted() && !vk_fg_failed();
 #ifdef GAME_OOT
+    if (g_output_format == VK_FORMAT_UNDEFINED) want_fg = 0;
     if (want_fg && !vk_present_amd_fg_compatible(sf)) {
         rt_log("gfx: AMD frame generation suspended: the selected %s swapchain format %d is unsupported",
                hdr ? "HDR10" : "SDR", (int)sf.format);
@@ -590,8 +603,9 @@ static int create_swapchain(void) {
     }
 #endif
     const int replace_fg = had_fg && want_fg && (g_sc_fmt != sf.format || g_sc_hdr != hdr ||
-                                                  g_sc_ext.width != ext.width || g_sc_ext.height != ext.height);
-    // Pending SDK presents can still submit work, so drain them before taking the queue lock.
+                                                 g_sc_ext.width != ext.width || g_sc_ext.height != ext.height);
+    // The SDK presenter can still have CPU work queued even when the Vulkan device is idle.
+    // Drain before taking the queue lock: pending SDK work can call submit_game.
     const int drain_fg = had_fg && (replace_fg || !want_fg);
     static unsigned failed_fg_drain_attempts;
     if (drain_fg && !vk_fg_wait_for_presents()) {
@@ -601,6 +615,7 @@ static int create_swapchain(void) {
         return 0;
     }
     failed_fg_drain_attempts = 0;
+
     vk_queue_lock();
     vkDeviceWaitIdle(c->device);
     vk_reflex_swapchain_destroyed();
@@ -613,10 +628,10 @@ static int create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = pick_present_mode(c->phys), .clipped = VK_TRUE,
         .oldSwapchain = old};
-    // AMD can remake the same output in place with SDK 2. A changed compatible output gets a fresh context;
-    // an unsupported output or a failed backend leaves the window to the other swapchain paths below.
+    // AMD can remake the same output in place, but a new output format, encoding or size needs a fresh context.
     VkResult r = VK_ERROR_FEATURE_NOT_PRESENT;
     if (had_fg || want_fg) {
+        // Drop the current owner's views and destroy a non-AMD swapchain through its own API.
         destroy_replaced_swapchain(c->device, had_fg ? VK_NULL_HANDLE : old);
         ci.oldSwapchain = VK_NULL_HANDLE;
         old = g_sc = VK_NULL_HANDLE;
@@ -636,11 +651,12 @@ static int create_swapchain(void) {
             return 0;
         }
         if (r != VK_SUCCESS && vk_fg_swapchain()) {   // frame generation stopped: its swapchain goes, a plain one follows
-            if (vk_fg_failed()) rt_log("gfx: frame generation stopped: replacing its swapchain");
+            rt_log("gfx: AMD frame generation %s: replacing its swapchain", want_fg ? "stopped" : "disabled");
             vk_fg_release();
             g_sc = VK_NULL_HANDLE;
         }
     }
+    int reflex_lat = 0;
     if (r != VK_SUCCESS && vk_dlssg_swapchain_ready()) r = vk_dlssg_create_swapchain(c->device, &ci, &g_sc);   // Streamline's hook
     else if (r != VK_SUCCESS) {
         // DEBUG-PRESENTTIMING: the plain swap chain asks for present timing; without it when the driver refuses
@@ -651,9 +667,7 @@ static int create_swapchain(void) {
         ci.pNext = gfx_window_swapchain_next(c->has_fse);
 #ifdef VK_NV_LOW_LATENCY_2_EXTENSION_NAME
         VkSwapchainLatencyCreateInfoNV reflex_ci = {0};
-        int reflex_lat = vk_reflex_swapchain_next(&ci, &reflex_ci);
-#else
-        int reflex_lat = 0;
+        reflex_lat = vk_reflex_swapchain_next(&ci, &reflex_ci);
 #endif
         r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
         if (r != VK_SUCCESS && old) {
@@ -675,7 +689,6 @@ static int create_swapchain(void) {
         }
         if (r == VK_SUCCESS && want_pt) pt_setup(c->device, g_sc);
         else pt_on = 0;
-        if (r == VK_SUCCESS) vk_reflex_swapchain_created(g_sc, reflex_lat);
     }
     destroy_replaced_swapchain(c->device, old);
     if (r != VK_SUCCESS) {
@@ -691,11 +704,11 @@ static int create_swapchain(void) {
     }
     g_sc_fmt = sf.format;
     g_sc_hdr = hdr;
-    g_sc_hdr_wanted = vk_hdr_wanted();
 #ifdef GAME_OOT
     g_sc_request_format = g_output_format;
-    g_output_failed_request = GFX_OUTPUT_UNSPECIFIED;
-    g_output_failed_format = VK_FORMAT_UNDEFINED;
+    rt_log("gfx: guest swapchain %s (format %d, requested format %d)", hdr ? "PQ" : "SDR", (int)sf.format, (int)g_output_format);
+#else
+    g_sc_hdr_wanted = vk_hdr_wanted();
 #endif
     vk_hdr_set_active(hdr);
     if (hdr) vk_hdr_metadata(g_sc, 1);
@@ -733,6 +746,7 @@ static int create_swapchain(void) {
         if (vkCreateImageView(c->device, &vi, NULL, &g_sc_view[i]) != VK_SUCCESS) g_sc_view[i] = VK_NULL_HANDLE;
     }
     free_capture();
+    if (!vk_fg_swapchain() && !vk_dlssg_swapchain_ready()) vk_reflex_swapchain_created(g_sc, reflex_lat);
     vk_queue_unlock();
     plat_cas32(&g_dirty, 0, 2);
     return 1;
@@ -1182,12 +1196,16 @@ static VkFormat g_hl_fmt;
 // else in TRANSFER_SRC_OPTIMAL; full: the whole path (a GENERAL source only), else the blit alone. slot picks the
 // source views those passes keep (one per frame in flight; frame generation's HUD-less picture takes the slots after
 // FRAMES). *psrc and prect: what the picture was read from at the end (the menu's live picture reads it again).
-// Returns vk_fsr_record's answer, 0 when the blit drew it.
+// pq_hudless encodes a linear checkpoint, then fits it with the same blit as the guest's PQ picture.
+// Returns -1 if that required encode failed, otherwise vk_fsr_record's answer or 0 for a blit.
 static int picture_into(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int w, int h, const int rect[4],
-                        int general, int full, VkImage dst, const int to[4], VkImage *psrc, int prect[4]) {
+                        int general, int full, const VkGuestPq *pq, VkImage dst, const int to[4], VkImage *psrc, int prect[4]) {
     int cw = rect[2], ch = rect[3];
-    VkImage graded = !full ? VK_NULL_HANDLE : g_sc_hdr ? vk_hdr_encode(cb, slot, src, fmt, rect, NULL)
-                                                         : vk_color_record(cb, slot, src, fmt, rect);
+    VkImage graded = pq || (full && g_sc_hdr) ? vk_hdr_encode(cb, slot, src, fmt, rect, pq) : VK_NULL_HANDLE;
+#ifndef GAME_OOT
+    if (!pq && full && !g_sc_hdr) graded = vk_color_record(cb, slot, src, fmt, rect);
+#endif
+    if (pq && !graded) return -1;
     *psrc = graded ? graded : src;
     VkFormat pfmt = graded ? VK_FORMAT_R16G16B16A16_SFLOAT : fmt;
     for (int i = 0; i < 4; i++) prect[i] = graded && i < 2 ? 0 : rect[i];   // the graded copy is the crop alone
@@ -1214,13 +1232,20 @@ static int picture_into(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat
 // 80 by default), the colour profile or FSR's scaling applied to one of them alone differed over the whole scene.
 // full: the game's picture took the whole path (it was in GENERAL). REKARINA_FG_HUDLESS_PLAIN=1: the bilinear blit alone,
 // as before (test).
-static VkImage hudless_record(uint64_t frame, VkCommandBuffer cb, unsigned slot, int w, int h, const int rect[4], const int to[4], int full) {
+static VkImage hudless_record(uint64_t frame, VkCommandBuffer cb, unsigned slot, int w, int h, const int rect[4],
+                              const int to[4], int full, const VkGuestPq *transform) {
     VkImage pic;
     VkImageView pv;
     uint32_t pw, ph;
     VkFormat pf;
-    if ((!vk_fg_active() && !vk_dlssg_active()) || !vk_dlaa_fg_hudless(frame, &pic, &pv, &pw, &ph, &pf) || (int)pw != w || (int)ph != h)
+    int pq;
+    if ((!vk_fg_active() && !vk_dlssg_active()) || !vk_dlaa_fg_hudless(frame, &pic, &pv, &pw, &ph, &pf, &pq) || (int)pw != w || (int)ph != h)
         return VK_NULL_HANDLE;
+#ifdef GAME_OOT
+    if (pq != g_sc_hdr || (g_sc_hdr && (!transform || !transform->valid))) return VK_NULL_HANDLE;
+#else
+    (void)transform;
+#endif
     VkCtx *c = vk_ctx();
     if (g_hl && (g_hl_w != g_sc_ext.width || g_hl_h != g_sc_ext.height || g_hl_fmt != g_sc_fmt)) {
         vk_queue_lock(), vkDeviceWaitIdle(c->device), vk_queue_unlock();
@@ -1256,7 +1281,12 @@ static VkImage hudless_record(uint64_t frame, VkCommandBuffer cb, unsigned slot,
     if (plain < 0) plain = rt_knob("FG_HUDLESS_PLAIN", "0");
     VkImage ps;
     int pr[4];
-    picture_into(cb, slot + FRAMES, pic, pf, w, h, rect, 1, full && !plain, g_hl, to, &ps, pr);
+    const VkGuestPq *pq_hudless = NULL;
+#ifdef GAME_OOT
+    if (g_sc_hdr) pq_hudless = transform;
+#endif
+    if (picture_into(cb, slot + FRAMES, pic, pf, w, h, rect, 1, full && !plain && !pq_hudless,
+                     pq_hudless, g_hl, to, &ps, pr) < 0) return VK_NULL_HANDLE;
     sync_barrier(cb, g_hl, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
@@ -1358,8 +1388,83 @@ uint64_t gfx_blit_gpu_ns(uint64_t frame) {   // the completion thread
     return t > 0 && t <= now ? (uint64_t)t : 0;
 }
 
+#ifdef GAME_OOT
+static struct {
+    uint64_t frame;
+    VkImage destination;
+    const char *shot;
+    VkImageView alpha;
+    int composed;
+    int preview[4];
+} guest_menu;
+static int32_t guest_menu_wanted;
+
+void vk_present_guest_menu(VkExec *ex, const VkTexImage *source, VkImage destination) {
+    int pq = ex->output_encoding == GFX_OUTPUT_PQ;
+    if ((!menu_is_open() && !plat_cas32(&guest_menu_wanted, 0, 0)) || (pq && !ex->output_pq.valid) ||
+        source->type != VK_IMAGE_TYPE_2D || source->layers != 1 || source->aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+        !(source->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+        (source->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 && source->format != VK_FORMAT_R16G16B16A16_SFLOAT))
+        return;
+    uint64_t frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
+    vk_present_drain();
+    plat_rmutex_lock(&g_pl);
+    if (!g_started || guest_menu.frame == frame) goto out;
+    vk_texture_lock();
+    VkImageView compositor = vk_exec_target_view(source, source->format, VK_IMAGE_VIEW_TYPE_2D,
+                                                 VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, 0);
+    vk_texture_unlock();
+    if (!compositor) goto out;
+    VkCtx *c = vk_ctx();
+    const uint32_t w = source->width, h = source->height;
+    MenuTarget target = {c->instance, c->phys, c->device, c->gfx_family, c->gfx_queue,
+                         VK_FORMAT_R8G8B8A8_UNORM, w, h, (int)w, (int)h, g_scaler, g_sc_ext.width, g_sc_ext.height,
+                         vk_dlaa_nvidia_scene_aa()};
+    guest_menu = (typeof(guest_menu)){.frame = frame, .destination = destination};
+    const CfgRenderState *settings = cfg_render_use(NULL);
+    int overlay = menu_overlay_frame(frame, &target, &guest_menu.shot);
+    cfg_render_use(settings);
+    plat_xchg32(&guest_menu_wanted, overlay);
+    if (!overlay) goto out;
+    if (plat_cas32(&g_shot_req, 0, 0) && !cfg_bool("REKARINA_SCREENSHOT_OVERLAY")) goto out;
+    vk_exec_barrier(ex);
+    VkImageView menu = vk_hdr_ui_target(ex->cb, w, h);
+    if (menu) {
+        VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = menu,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}},
+                              .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
+        vkCmdBeginRendering(ex->cb, &ri);
+        menu_overlay_draw(ex->cb, 0);
+        vkCmdEndRendering(ex->cb);
+        if (!menu_preview_rect(guest_menu.preview)) memset(guest_menu.preview, 0, sizeof guest_menu.preview);
+        int *p = guest_menu.preview;
+        if (p[0] < 0 || p[1] < 0 || p[2] <= 0 || p[3] <= 0 || p[0] + p[2] > (int)w || p[1] + p[3] > (int)h)
+            memset(p, 0, sizeof guest_menu.preview);
+        guest_menu.composed = vk_hdr_ui_guest_compose(ex->cb, source, compositor, p, pq ? &ex->output_pq : NULL);
+        if (guest_menu.composed && menu_overlay_can_replay()) guest_menu.alpha = menu;
+        // The host pipelines set guest-dynamic state statically on the same command buffer.
+        vk_pipeline_dynamic_forget();
+    }
+    ex->recorded++;
+    vk_exec_draw_new_cb();
+    ex->dirty |= VK_EXEC_DIRTY_ALL;
+    vk_exec_pass_begin(ex);
+    if (guest_menu.composed) {
+        static int logged[2];
+        if (!logged[pq]++) rt_log("gfx: menu blended into the game compositor before the checked %s output", pq ? "PQ" : "SDR");
+    }
+out:
+    plat_rmutex_unlock(&g_pl);
+}
+#endif
+
 static int present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], int defer,
-                         GfxOutputEncoding encoding) {
+                         const VkGuestPq *pq, const char *nvidia_scene_aa) {
+#ifndef GAME_OOT
+    (void)nvidia_scene_aa;
+#endif
     int tagged = 0;
     int general = layout == VK_IMAGE_LAYOUT_GENERAL;
     {   // DEBUG-FOCUS: REKARINA_TEST_FOCUS=<frame>,<frame>: the window "loses" the focus at the first frame and gains it at
@@ -1417,36 +1522,20 @@ static int present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w,
     flip_locked();
     FT(FT_NOTE, 3, 0, 0);
 #ifdef GAME_OOT
-    if (encoding != GFX_OUTPUT_UNSPECIFIED) {
-        if (encoding != g_output_request || fmt != g_output_format) {
-            g_output_failed_request = GFX_OUTPUT_UNSPECIFIED;
-            g_output_failed_format = VK_FORMAT_UNDEFINED;
-        }
-        g_output_request = encoding;
-        g_output_format = fmt;
+    if (defer) g_output_format = fmt;
+    int mismatch = g_sc_request_format != g_output_format;
+    int available = wsys_minimized() == 0;
+    if (available && (!g_sc || mismatch || plat_cas32(&g_dirty, 0, 0))) {
+        if (!create_swapchain() && (mismatch || !g_sc)) goto out;
     }
-    int dirty = plat_cas32(&g_dirty, 0, 0);
-    if (dirty) {
-        g_output_failed_request = GFX_OUTPUT_UNSPECIFIED;
-        g_output_failed_format = VK_FORMAT_UNDEFINED;
-    }
-    if (guest_output_controls_swapchain() &&
-        (g_sc_hdr != (g_output_request == GFX_OUTPUT_PQ) || g_sc_request_format != g_output_format)) {
-        if (wsys_minimized()) goto out;
-        if (!dirty && g_output_failed_request == g_output_request && g_output_failed_format == g_output_format) goto out;
-        if (!create_swapchain()) {
-            g_output_failed_request = g_output_request;
-            g_output_failed_format = g_output_format;
-            goto out;
-        }
-    } else
-#endif
+#else
     if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
         if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
     }
+#endif
     if (wsys_minimized() || !g_sc) goto out;
 #ifdef GAME_OOT
-    if (g_sc_hdr && guest_output_controls_swapchain() && !gfx_hdr_surface_capable()) goto out;
+    if (g_sc_hdr && !gfx_hdr_surface_capable()) goto out;
 #endif
 
     unsigned slot = g_frame % FRAMES;
@@ -1455,21 +1544,21 @@ static int present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w,
         goto out;
     }
     uint32_t idx = 0;
-    VkResult r = vk_fg_swapchain() ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
-               : vk_dlssg_swapchain_ready() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
-                                : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+    VkResult r = acquire_locked(c->device, g_acquire[slot], &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         plat_xchg32(&g_dirty, 1);
         if (!create_swapchain()) goto out;
-        r = vk_fg_swapchain() ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
-          : vk_dlssg_swapchain_ready() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
-                           : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+        r = acquire_locked(c->device, g_acquire[slot], &idx);
     }
     vk_device_fault_report(r);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;     // lost, not ready: skip the frame
     if (r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
     vkResetFences(c->device, 1, &g_fence[slot]);
-    if (g_sc_hdr) vk_hdr_metadata(g_sc, 0);   // a changed peak or white goes to the display
+    if (g_sc_hdr) {   // a changed peak or white goes to the display
+        vk_reflex_wsi_lock();
+        vk_hdr_metadata(g_sc, 0);
+        vk_reflex_wsi_unlock();
+    }
     if (g_th_pending[slot]) {   // that fence has signalled: the thumbnail its submission wrote is complete
         g_th_tag[g_th_pending[slot] % (uint64_t)g_th_n] = g_th_pending[slot];
         g_th_pending[slot] = 0;
@@ -1486,11 +1575,29 @@ static int present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w,
     const char *menu_shot = NULL;
     MenuTarget mt = {c->instance, c->phys, c->device, c->gfx_family, c->gfx_queue,
                      g_sc_hdr ? VK_FORMAT_R8G8B8A8_UNORM : g_sc_fmt, g_sc_ext.width,
-                     g_sc_ext.height, cw, ch, g_scaler};
-    const CfgRenderState *settings = cfg_render_use(NULL);
-    int overlay = g_sc_view[idx] &&
-                  menu_overlay_frame(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), &mt, &menu_shot);
-    cfg_render_use(settings);
+                     g_sc_ext.height, cw, ch, g_scaler
+#ifdef GAME_OOT
+                     , g_sc_ext.width, g_sc_ext.height, nvidia_scene_aa
+#endif
+    };
+    int overlay = 0;
+#ifdef GAME_OOT
+    int pre_output_menu = guest_menu.frame == bt_frame_next &&
+                          guest_menu.composed && guest_menu.destination == src;
+    if (pre_output_menu) menu_shot = guest_menu.shot;
+    else
+#endif
+    if (g_sc_view[idx]) {
+        const CfgRenderState *settings = cfg_render_use(NULL);
+        overlay = menu_overlay_frame(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), &mt, &menu_shot);
+        cfg_render_use(settings);
+#ifdef GAME_OOT
+        plat_xchg32(&guest_menu_wanted, overlay);
+#endif
+    }
+#ifdef GAME_OOT
+    if (g_sc_hdr || pre_output_menu) overlay = 0;
+#endif
     if (plat_xchg32(&g_shot_req, 0) && !menu_shot) {   // the screenshot key (input.c): this frame into screenshots/
         menu_shot = screenshot_path();
         if (menu_shot && !cfg_bool("REKARINA_SCREENSHOT_OVERLAY")) overlay = 0;   // the picture alone, the menu left out
@@ -1553,7 +1660,11 @@ static int present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w,
     }
     VkImage psrc;
     int prect[4];
-    int fsr = picture_into(cb, slot, src, fmt, w, h, rect, general, general && encoding != GFX_OUTPUT_PQ, dst, to, &psrc, prect);
+    int full_picture = general;
+#ifdef GAME_OOT
+    if (g_sc_hdr) full_picture = 0;   // The guest's completed output shader already wrote PQ.
+#endif
+    int fsr = picture_into(cb, slot, src, fmt, w, h, rect, general, full_picture, 0, dst, to, &psrc, prect);
     g_scaler = fsr == 1 ? 2 : cw != to[2] || ch != to[3];   // 2 from vk_fsr_record: sharpened, not scaled
     // The open menu's live picture (ui/menu.cpp): the game picture once more, scaled into the menu's frame; the menu
     // leaves that rectangle clear.
@@ -1579,9 +1690,8 @@ static int present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w,
     }
     // frame generation's picture without the HUD, through the same path; after the menu's live picture, which reads the
     // colour adjustment's image that this makes again
-    // The PQ presentation path does not yet have a matching HUD-less encode and scale path.
-    VkImage hudless = src && encoding != GFX_OUTPUT_PQ ?
-        hudless_record(bt_frame_next, cb, slot, w, h, rect, to, general) : VK_NULL_HANDLE;
+    VkImage hudless = src ?
+        hudless_record(bt_frame_next, cb, slot, w, h, rect, to, general, pq) : VK_NULL_HANDLE;
     hlshot = hlshot && hudless && hlcap_buffer();
     if (hlshot) {   // DEBUG-HLSHOT
         sync_barrier(cb, hudless, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -1596,43 +1706,64 @@ static int present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w,
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     VkPipelineStageFlags2 last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     VkAccessFlags2 last_write = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    // HDR10: the menu goes into vk_hdr.c's RGBA8 image, which is then blended onto the swapchain image at the HUD's white
+#ifdef GAME_OOT
+    VkImageView menu_view = VK_NULL_HANDLE;
+#else
     VkImageView menu_view = overlay && g_sc_hdr ? vk_hdr_ui_target(cb, g_sc_ext.width, g_sc_ext.height) : VK_NULL_HANDLE;
     if (overlay && g_sc_hdr && !menu_view) overlay = 0;
-    VkImage interface_coverage = VK_NULL_HANDLE;
-    VkImageView interface_coverage_view = VK_NULL_HANDLE;
-    if (hudless && g_hl_view && general && vk_interface_coverage_enabled() &&
-        (!overlay || menu_overlay_prepare_coverage()))
-        vk_interface_coverage_present(cb, bt_frame_next, src, (VkExtent2D){(uint32_t)w, (uint32_t)h},
-                                      g_sc_ext, rect, to, &interface_coverage, &interface_coverage_view);
+#endif
     if (overlay) {
         sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, last_stage, last_write,
                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        VkRenderingAttachmentInfo ca[2] = {{.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
                                         .imageView = menu_view ? menu_view : g_sc_view[idx],
                                         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                         .loadOp = menu_view ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-                                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE},
-            {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = interface_coverage_view,
-             .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-             .storeOp = VK_ATTACHMENT_STORE_OP_STORE}};
+                                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
         VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, g_sc_ext}, .layerCount = 1,
-                              .colorAttachmentCount = interface_coverage_view ? 2 : 1, .pColorAttachments = ca};
+                              .colorAttachmentCount = 1, .pColorAttachments = &ca};
         vkCmdBeginRendering(cb, &ri);
-        menu_overlay_draw(cb, interface_coverage_view != VK_NULL_HANDLE);
+        menu_overlay_draw(cb, 0);
         vkCmdEndRendering(cb);
-        if (interface_coverage_view) {
-            sync_barrier(cb, interface_coverage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
-            static unsigned logged;
-            if (logged++ < 8) rt_log("interface coverage: host overlay included via MRT frame %llu", (unsigned long long)bt_frame_next);
-        }
+#ifndef GAME_OOT
         if (menu_view) vk_hdr_ui_compose(cb, g_sc_view[idx], g_sc_fmt, g_sc_ext.width, g_sc_ext.height);
+#endif
         last = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         last_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         last_write = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    }
+    VkImage interface_coverage = VK_NULL_HANDLE;
+    VkImageView interface_coverage_view = VK_NULL_HANDLE;
+    int coverage_pair = hudless && g_hl_view && general && vk_interface_coverage_enabled();
+    VkImageView guest_alpha = VK_NULL_HANDLE;
+    const int *guest_preview = NULL;
+#ifdef GAME_OOT
+    if (pre_output_menu) {
+        guest_alpha = guest_menu.alpha;
+        guest_preview = guest_menu.preview;
+        if (!guest_alpha) coverage_pair = 0;
+    }
+#endif
+    if (coverage_pair) {
+        VkImageView overlay_alpha = guest_alpha;
+        if (overlay && menu_overlay_can_replay()) {
+            overlay_alpha = vk_interface_coverage_overlay(cb, bt_frame_next, g_sc_ext,
+                                                          menu_view ? VK_FORMAT_R8G8B8A8_UNORM : g_sc_fmt);
+            if (overlay_alpha) {
+                VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                    .imageView = overlay_alpha, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+                VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, g_sc_ext},
+                    .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
+                vkCmdBeginRendering(cb, &ri);
+                menu_overlay_draw(cb, 1);
+                vkCmdEndRendering(cb);
+            }
+        }
+        if (!overlay || overlay_alpha)
+            vk_interface_coverage_present(cb, bt_frame_next, src, (VkExtent2D){(uint32_t)w, (uint32_t)h},
+                                          g_sc_ext, rect, to, overlay_alpha, guest_preview, &interface_coverage, &interface_coverage_view);
     }
     if (cap || video) {
         sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, last_stage, last_write,
@@ -1714,13 +1845,13 @@ out:
 }
 
 void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]) {
-    present_image(src, layout, fmt, w, h, crop, 0, GFX_OUTPUT_UNSPECIFIED);
+    present_image(src, layout, fmt, w, h, crop, 0, NULL, NULL);
 }
 
 int vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4],
-                    GfxOutputEncoding encoding) {
+                    const VkGuestPq *pq, const char *nvidia_scene_aa) {
     if (!src) return 0;
-    return present_image(src, layout, fmt, w, h, crop, 1, encoding);
+    return present_image(src, layout, fmt, w, h, crop, 1, pq, nvidia_scene_aa);
 }
 
 void vk_present_flip(void) {
@@ -1770,9 +1901,10 @@ void gfx_window_release_vk(void) {
         if (g_surface) vkDestroySurfaceKHR(c->instance, g_surface, NULL);
         g_sc = VK_NULL_HANDLE; g_surface = VK_NULL_HANDLE; g_pool = VK_NULL_HANDLE; g_sc_n = 0;
 #ifdef GAME_OOT
+        memset(&guest_menu, 0, sizeof guest_menu);
+        plat_xchg32(&guest_menu_wanted, 0);
+        g_output_format = g_sc_request_format = VK_FORMAT_UNDEFINED;
         plat_xchg32(&g_surface_pq, 0);
-        g_output_request = g_output_failed_request = GFX_OUTPUT_UNSPECIFIED;
-        g_output_format = g_sc_request_format = g_output_failed_format = VK_FORMAT_UNDEFINED;
 #endif
         g_started = 0;     // the window and its thread stay; the next gfx_window_start makes a new surface
     }
@@ -1829,26 +1961,29 @@ void gfx_present_prep_frame(void) {
         if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
     }
     if (wsys_minimized() || !g_sc) goto out;
+#ifdef GAME_OOT
+    if (g_sc_hdr) goto out;   // The boot menu has no guest encoder and only draws in SDR.
+#endif
     unsigned slot = g_frame % FRAMES;
     if (vkWaitForFences(c->device, 1, &g_fence[slot], VK_TRUE, 5000000000ull) != VK_SUCCESS) goto out;
     uint32_t idx = 0;
     // as present_image: a frame generation swapchain (set at its start from the settings) hands out its own images
-    VkResult r = vk_fg_swapchain() ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
-               : vk_dlssg_swapchain_ready() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
-                                : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+    VkResult r = acquire_locked(c->device, g_acquire[slot], &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         plat_xchg32(&g_dirty, 1);
         if (!create_swapchain()) goto out;
-        r = vk_fg_swapchain() ? vk_fg_acquire(g_sc, 1000000000ull, g_acquire[slot], &idx)
-          : vk_dlssg_swapchain_ready() ? vk_dlssg_acquire(c->device, g_sc, 1000000000ull, g_acquire[slot], &idx)
-                           : vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
+        r = acquire_locked(c->device, g_acquire[slot], &idx);
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) goto out;
     if (r == VK_SUBOPTIMAL_KHR) plat_xchg32(&g_dirty, 1);
     vkResetFences(c->device, 1, &g_fence[slot]);
     MenuTarget mt = {c->instance, c->phys, c->device, c->gfx_family, c->gfx_queue,
                      g_sc_hdr ? VK_FORMAT_R8G8B8A8_UNORM : g_sc_fmt, g_sc_ext.width, g_sc_ext.height,
-                     (int)g_sc_ext.width, (int)g_sc_ext.height, 0};
+                     (int)g_sc_ext.width, (int)g_sc_ext.height, 0
+#ifdef GAME_OOT
+                     , g_sc_ext.width, g_sc_ext.height, NULL
+#endif
+    };
     const char *menu_shot = NULL;
     int overlay = g_sc_view[idx] && menu_overlay_frame(0, &mt, &menu_shot);
     {
@@ -1874,8 +2009,12 @@ void gfx_present_prep_frame(void) {
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     VkPipelineStageFlags2 last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     VkAccessFlags2 last_write = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+#ifdef GAME_OOT
+    VkImageView menu_view = VK_NULL_HANDLE;
+#else
     VkImageView menu_view = overlay && g_sc_hdr ? vk_hdr_ui_target(cb, g_sc_ext.width, g_sc_ext.height) : VK_NULL_HANDLE;
     if (overlay && g_sc_hdr && !menu_view) overlay = 0;
+#endif
     if (overlay) {
         sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, last_stage, last_write,
                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1890,7 +2029,9 @@ void gfx_present_prep_frame(void) {
         vkCmdBeginRendering(cb, &ri);
         menu_overlay_draw(cb, 0);
         vkCmdEndRendering(cb);
+#ifndef GAME_OOT
         if (menu_view) vk_hdr_ui_compose(cb, g_sc_view[idx], g_sc_fmt, g_sc_ext.width, g_sc_ext.height);
+#endif
         last = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         last_stage = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         last_write = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;

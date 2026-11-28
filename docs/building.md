@@ -173,8 +173,9 @@ build reads `rekarina.ini` and writes `logs\rekarina.log`, the names its package
 
 `.venv\Scripts\python tools\package_build.py --version <ver>` writes `build\<ver>-portable`, which runs on another of
 your machines without MSYS2, Python or .NET. `romfs.bin` stays out unless you pass `--with-romfs`; otherwise put it in
-`romfs\` next to the exe or point `REKARINA_ROMFS` at its folder. Run `rekarina.exe --prepare-shaders` once in the copied
-folder. The folder holds code and data derived from your game: for your own machines only.
+`romfs\` next to the exe or point `REKARINA_ROMFS` at its folder. If the image cannot be opened, the game reports the
+path in its log and exits before starting graphics. Run `rekarina.exe --prepare-shaders` once in the copied folder.
+The folder holds code and data derived from your game: for your own machines only.
 
 ### Profile-guided build
 

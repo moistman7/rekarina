@@ -1805,10 +1805,34 @@ static void dump_missing(const char *path, int os_error) {
              "REKARINA_ROMFS or --romfs names the .nup)", path, os_error);
 }
 
+static void open_image_once(void *param) {
+    (void)param;
+    const char *path = rt_config()->romfs;
+    if (ends_with_nup(path)) {
+        need(snprintf(image_file, sizeof image_file, "%s", path) < (int)sizeof image_file, "image path");
+        image = open_read(image_file);
+        if (!image) dump_missing(image_file, plat_last_os_error());
+        return;
+    }
+#ifdef ROMFS_MISSING
+    rt_fatal("this build has no RomFS: tools/build_game.py found no index.json in its --romfs directory");
+#else
+    need(snprintf(image_file, sizeof image_file, "%s/romfs.bin", path) < (int)sizeof image_file, "image path");
+    image = open_read(image_file);
+    if (!image)
+        rt_fatal("RomFS image %s is missing or cannot be opened (OS error %d); put romfs.bin in the romfs folder next "
+                 "to " RT_FILE_STEM ".exe or set rekarina.ini [paths] romfs, REKARINA_ROMFS or --romfs",
+                 image_file, plat_last_os_error());
+#endif
+}
+
+void romfs_open_image(void) {
+    static PlatOnce once = PLAT_ONCE_INIT;
+    plat_once(&once, open_image_once, NULL);
+}
+
 // The RomFS from a .nup file (REKARINA_ROMFS / --romfs naming the container itself).
-static int init_nup(void) {
-    const char *nup = rt_config()->romfs;
-    if (!ends_with_nup(nup)) return 0;
+static void init_nup(void) {
     double t0 = now_s();
     char path[2100];
     index_path(path, sizeof path);   // overlays (romfs-patches, prompts) still live next to the exe
@@ -1816,30 +1840,23 @@ static int init_nup(void) {
     char *sep = plat_last_sep(index_dir);
     if (sep) *sep = 0;
     else strcpy(index_dir, ".");
-    need(snprintf(image_file, sizeof image_file, "%s", nup) < (int)sizeof image_file, "image path");
-    image = open_read(image_file);
-    if (!image) dump_missing(image_file, plat_last_os_error());
     index_bytes = nup_index(image, image_file, &index_size, &file_count, &strings_offset, &nup_extra);
     nup_mode = 1;
     overlay_init();
     rt_log("RomFS ready from %s: %llu files, %zu overlays, %zu added, %.2f s", image_file,
            (unsigned long long)file_count, noverlay, nadded, now_s() - t0);
-    return 1;
 }
 
 static void init_once(void *param) {
     (void)param;
-    if (init_nup()) return;
-#ifdef ROMFS_MISSING
-    rt_fatal("this build has no RomFS: tools/build_game.py found no index.json in its --romfs directory");
-#else
+    romfs_open_image();
+    if (ends_with_nup(image_file)) {
+        init_nup();
+        return;
+    }
+#ifndef ROMFS_MISSING
     double t0 = now_s();
     load_index();
-    const char *dir = rt_config()->romfs;
-    need(snprintf(image_file, sizeof image_file, "%s/romfs.bin", dir) < (int)sizeof image_file, "image path");
-    image = open_read(image_file);
-    if (!image) rt_fatal("RomFS image %s missing; put romfs.bin into the romfs folder next to totk or set REKARINA_ROMFS",
-                         image_file);
     PlatFileId sz;
     need(plat_file_id(image, &sz), "image size");
     if (sz.size != ROMFS_IMAGE_SIZE)

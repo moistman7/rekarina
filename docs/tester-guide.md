@@ -104,7 +104,8 @@ fullscreen, the screen's own 1280x800 (16:10: the camera and interface take that
 vsync and a 40 fps limit. These are starting points, not measurements. What helps most:
 
 1. The performance overlay (F10, or both stick clicks L3 + R3) in full mode: the frame rate, mean and longest frame
-   time over a minute in the first town, in the Depths and in the Sky, with the settings named.
+   time over a minute in the first town, in the Depths and in the Sky, with the settings named. The Window row
+   shows the actual window or fullscreen output in pixels; Game image shows the picture size before display scaling.
 2. The same with `fps_limit` 30, 45 and 60 and `render_scale` 50, 67 and game, so the defaults can be picked from
    measurements. Steam's own performance overlay (the ... button) adds power draw and temperatures.
 3. LCD or OLED, SteamOS version (`uname -r` in Desktop Mode's terminal), and the game update.
@@ -171,7 +172,7 @@ whether that changed it.
 
 ### Checklist for a handheld or a small PC (OoT)
 
-The menu (Esc, or Minus and Plus held together) shows what the game found: on the Screen tab, the *Graphics card* row's
+The menu (Esc, or Minus and Plus held together) shows what the game found: on the Graphics tab, the *Graphics card* row's
 picture lists the card, driver, video memory, processor, memory, display and the device profile with the reason it was
 chosen; the *Performance overlay* row's picture shows the frame times, the CPU and GPU time per frame and the memory in
 use. A photo or screenshot of those two pictures and `logs/rekarina.log` answer most questions. Mark each item done,
@@ -204,7 +205,7 @@ ROG Ally, Ally X, ROG Xbox Ally, Legion Go, MSI Claw (Windows):
 
 A PC with 16 GB of memory or a 4 GB graphics card:
 
-1. The System picture's video memory, and *Texture quality* on the Screen tab (Automatic picks half or quarter on a
+1. The System picture's video memory, and *Texture quality* on the Graphics tab (Automatic picks half or quarter on a
    small card).
 2. Ten minutes in the field and the Market: the overlay's VRAM and RAM bars, any "video memory" notice, any frame
    over 25 ms the graph shows as a spike.

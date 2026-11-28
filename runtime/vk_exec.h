@@ -58,12 +58,25 @@ typedef struct VkExec {
     // ---- render targets (OP_SET_RT) and the current pass
     p_set_rt rt;                         // last OP_SET_RT payload (a change ends the open pass); rt.n 0, no depth: none
     unsigned draw_role;                // scoped to a checked postprocess draw
+    int interface_coverage;
     uint32_t direct_draw_source;
-    unsigned scene_output_role;
-#ifdef GAME_OOT
     GfxOutputEncoding output_encoding;
+#ifdef GAME_OOT
+    int motion_models, motion_reverse_only, prebloom_tonemap;
     VkGuestPq output_pq;
+    struct {
+        uint64_t frame;
+        uint32_t composite;
+        VkImage probe_source;
+        const op_hdr *ops[4];
+        const GfxShader *shader[4];
+        VkPipeline pipeline[4];
+        const VkPipeInfo *info[4];
+        unsigned phase;
+        int active;
+    } hdr_aa;
 #endif
+    unsigned scene_output_role;
     VkImage interface_copy_source;      // confirmed window-encode input, committed only after the draw is recorded
     VkImageView interface_replay_view;
     VkPipeline interface_replay_pipeline;
@@ -157,6 +170,9 @@ typedef struct VkExec {
 // Begins dynamic rendering with the current targets unless a pass is open (a full memory barrier precedes it). Call
 // before a draw or an attachment clear.
 void vk_exec_resolve_targets(VkExec *ex);
+#ifdef GAME_OOT
+void vk_present_guest_menu(VkExec *ex, const VkTexImage *source, VkImage destination);
+#endif
 void vk_exec_pass_begin(VkExec *ex);
 // Ends the open pass (no-op without one) and marks its targets GPU-written. Call before copies and dispatches.
 void vk_exec_pass_end(VkExec *ex);

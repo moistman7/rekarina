@@ -24,6 +24,9 @@ int vk_dlaa_fsr1(void);
 int vk_dlaa_fsr3(void);
 double gfx_output_fps(void);
 double frame_step_limit_hz(void);
+#ifdef GAME_OOT
+void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]);
+#endif
 }
 
 static const ImU32 kCream = IM_COL32(246, 239, 214, 255), kDim = IM_COL32(201, 192, 165, 255);
@@ -57,10 +60,20 @@ static bool key_is(const char *key, const char *const *list) {
 }
 
 static const char *const kPipeScene[] = {"REKARINA_RENDER_SCALE", nullptr};
-static const char *const kPipeUpscale[] = {"REKARINA_DLAA", "REKARINA_TAA", "REKARINA_DLSS", "REKARINA_DLSS_PRESET",
-                                           "REKARINA_FSR_VERSION", "REKARINA_FRAMEGEN", nullptr};
+static const char *const kPipeUpscale[] = {"##scene_upscaler", "REKARINA_DLAA", "REKARINA_TAA", "REKARINA_DLSS", "REKARINA_DLSS_PRESET",
+                                           "REKARINA_FSR_VERSION",
+#ifndef GAME_OOT
+                                           "REKARINA_FRAMEGEN",
+#endif
+                                           nullptr};
 static const char *const kPipePicture[] = {"REKARINA_GAME_RES", "REKARINA_GAME_ASPECT", nullptr};
-static const char *const kPipeWindow[] = {"REKARINA_UPSCALER", "REKARINA_SHARPNESS", "REKARINA_ASPECT",
+#ifdef GAME_OOT
+static const char *const kPipeFlow[] = {"REKARINA_SHARPNESS", "REKARINA_HDR", "REKARINA_FRAMEGEN", nullptr};
+#endif
+static const char *const kPipeWindow[] = {"REKARINA_UPSCALER", "##hdr_display_scaling", "REKARINA_ASPECT",
+#ifndef GAME_OOT
+                                          "REKARINA_SHARPNESS",
+#endif
                                           "REKARINA_WINDOW_SIZE", "REKARINA_FULLSCREEN", nullptr};
 static const char *const kPad[] = {"REKARINA_PAD_LAYOUT", "REKARINA_PAD_FOLLOW", "REKARINA_PAD_DRIVER", "REKARINA_MOTION",
                                    "REKARINA_VIBRATION", "REKARINA_DUALSENSE_EXTRAS", "REKARINA_RUMBLE_STRENGTH",
@@ -76,6 +89,9 @@ MenuPicture menu_picture_for(const char *key) {
     if (!key || !*key) return PIC_NONE;
     if (key_is(key, kPipeScene) || key_is(key, kPipeUpscale) || key_is(key, kPipePicture) || key_is(key, kPipeWindow))
         return PIC_PIPELINE;
+#ifdef GAME_OOT
+    if (key_is(key, kPipeFlow)) return PIC_PIPELINE;
+#endif
     if (!strncmp(key, "REKARINA_BIND_", 14)) return input_kbm_last() ? PIC_KEYS : PIC_PAD;   // the device in hand
     if (key_is(key, kPad)) return PIC_PAD;
     if (key_is(key, kKeys)) return PIC_KEYS;
@@ -84,7 +100,7 @@ MenuPicture menu_picture_for(const char *key) {
     return PIC_NONE;
 }
 
-// ---- the picture pipeline: four cards, scene -> upscaling -> game image -> window, the stage the row sets edged in amber
+// ---- resolution cards and the gameplay flow
 static const char *ratio_name(int w, int h, char *buf, size_t n) {
     static const struct { int a, b; } r[] = {{16, 9}, {16, 10}, {21, 9}, {32, 9}, {4, 3}, {3, 2}, {43, 18}, {12, 5}};
     double q = h > 0 ? (double)w / h : 0;
@@ -97,46 +113,78 @@ static const char *ratio_name(int w, int h, char *buf, size_t n) {
     return buf;
 }
 
+static const char *upscale_quality(bool nvidia) {
+    const struct { const char *mode; UiTextId name; } modes[] = {
+        {"dlaa", nvidia ? UI_MENU_DLSS_DLAA : UI_MENU_UPSCALE_NATIVE},
+        {"quality", UI_MENU_DLSS_QUALITY}, {"balanced", UI_MENU_DLSS_BALANCED},
+        {"performance", UI_MENU_DLSS_PERFORMANCE}, {"ultra_performance", UI_MENU_DLSS_ULTRA}};
+    const char *mode = cfg_value("REKARINA_DLSS");
+    for (const auto &e : modes)
+        if (!strcmp(mode, e.mode)) return menu_text(e.name);
+    return "";
+}
+
 static float draw_pipeline(const char *key, ImDrawList *dl, float x, float y, float w, float scale, const MenuTarget *t) {
     const float fs = ImGui::GetFontSize(), cap = floorf(fs * 0.66f), val = floorf(fs * 0.80f), sub = floorf(fs * 0.64f);
-    char v[4][64], s[4][64];
+#ifdef GAME_OOT
+    enum { Scene, Picture, Window, Count };
+    const UiTextId caps[Count] = {UI_MENU_OV_SCENE, UI_MENU_OV_OUTPUT, UI_MENU_OV_WINDOW};
+    const char *const *stage[Count] = {kPipeScene, kPipePicture, kPipeWindow};
+#else
+    enum { Scene, Upscaler, Picture, Window, Count };
+    const UiTextId caps[Count] = {UI_MENU_OV_SCENE, UI_PIC_UPSCALING, UI_MENU_OV_OUTPUT, UI_MENU_OV_WINDOW};
+    const char *const *stage[Count] = {kPipeScene, kPipeUpscale, kPipePicture, kPipeWindow};
+#endif
+    char v[Count][64], s[Count][64];
+#ifndef GAME_OOT
     unsigned out[2], scene[2];
     res_sizes(out, scene);
-    double share = res_fixed_scene_share();
+#endif
+    const double share = res_fixed_scene_share();
     if (share > 0) {
-        snprintf(v[0], 64, "%u \xc3\x97 %u", (unsigned)(t->image_w * share + 0.5), (unsigned)(t->image_h * share + 0.5));
-        snprintf(s[0], 64, "%.0f %%", share * 100);
+        snprintf(v[Scene], 64, "%u \xc3\x97 %u", (unsigned)(t->image_w * share + 0.5), (unsigned)(t->image_h * share + 0.5));
+#ifdef GAME_OOT
+        snprintf(s[Scene], 64, menu_text(UI_PIC_SCENE_ESTIMATE), share * 100);
+#else
+        snprintf(s[Scene], 64, "%.0f %%", share * 100);
+#endif
     } else {
-        snprintf(v[0], 64, "%u \xc3\x97 %u", scene[0], scene[1]);
-        snprintf(s[0], 64, "%.0f %%", out[0] ? scene[0] * 100.0 / out[0] : 100.0);
+#ifdef GAME_OOT
+        strcpy(v[Scene], "-");
+        s[Scene][0] = 0;
+#else
+        snprintf(v[Scene], 64, "%u \xc3\x97 %u", scene[0], scene[1]);
+        snprintf(s[Scene], 64, "%.0f %%", out[0] ? scene[0] * 100.0 / out[0] : 100.0);
+#endif
     }
-    bool temporal = cfg_bool("REKARINA_DLAA") && vk_dlaa_available();
-    s[1][0] = 0;
-    if (temporal) {
-        snprintf(v[1], 64, "%s", vk_dlaa_fsr1() ? "AMD FSR 1" : vk_dlaa_fsr3() ? "AMD FSR" : "NVIDIA DLSS");
-        static const struct { const char *mode; UiTextId name; } modes[] = {
-            {"dlaa", UI_MENU_DLSS_DLAA}, {"quality", UI_MENU_DLSS_QUALITY}, {"balanced", UI_MENU_DLSS_BALANCED},
-            {"performance", UI_MENU_DLSS_PERFORMANCE}, {"ultra_performance", UI_MENU_DLSS_ULTRA}};
-        const char *m = cfg_value("REKARINA_DLSS");
-        for (const auto &e : modes)
-            if (!strcmp(m, e.mode)) snprintf(s[1], 64, "%s", menu_text(e.name));
+#ifdef GAME_OOT
+    int fit[4];
+    gfx_fit_rect(t->image_w, t->image_h, t->window_w, t->window_h, fit);
+    snprintf(v[Window], 64, "%u \xc3\x97 %u", t->window_w, t->window_h);
+    snprintf(s[Window], 64, menu_text(UI_PIC_DISPLAY_FIT_SIZE), fit[2], fit[3]);
+#else
+    const bool upscaler = cfg_bool("REKARINA_DLAA") && vk_dlaa_available();
+    s[Upscaler][0] = 0;
+    if (upscaler) {
+        const bool fsr1 = vk_dlaa_fsr1(), fsr3 = vk_dlaa_fsr3();
+        snprintf(v[Upscaler], 64, "%s", fsr1 ? "AMD FSR 1" : fsr3 ? "AMD FSR" : "NVIDIA DLSS");
+        snprintf(s[Upscaler], 64, "%s", upscale_quality(!fsr1 && !fsr3));
     } else {
-        snprintf(v[1], 64, "%s", menu_text(UI_MENU_OFF));
+        snprintf(v[Upscaler], 64, "%s", menu_text(UI_MENU_OFF));
     }
     if (gfx_output_fps() > 0) {   // frame generation shows frames of its own between the game's
-        size_t n = strlen(s[1]);
-        snprintf(s[1] + n, 64 - n, "%s+ FG", n ? " " : "");
+        size_t n = strlen(s[Upscaler]);
+        snprintf(s[Upscaler] + n, 64 - n, "%s+ FG", n ? " " : "");
     }
-    snprintf(v[2], 64, "%d \xc3\x97 %d", t->image_w, t->image_h);
-    ratio_name(t->image_w, t->image_h, s[2], 64);
-    snprintf(v[3], 64, "%u \xc3\x97 %u", t->width, t->height);
-    if (t->scaler == 2) snprintf(s[3], 64, "AMD FSR 1");
-    else snprintf(s[3], 64, "%s", menu_text(t->scaler ? UI_MENU_OV_SCALE_BILINEAR : UI_MENU_OV_SCALE_NONE));
-    const UiTextId caps[4] = {UI_MENU_OV_SCENE, UI_PIC_UPSCALING, UI_MENU_OV_OUTPUT, UI_MENU_OV_WINDOW};
-    const char *const *stage[4] = {kPipeScene, kPipeUpscale, kPipePicture, kPipeWindow};
-    const float arrow = floorf(fs * 0.9f), cw = floorf((w - arrow * 3) / 4), ch = floorf(val * 1.5f + sub * 1.5f);
+    snprintf(v[Window], 64, "%u \xc3\x97 %u", t->width, t->height);
+    if (t->scaler == 2) snprintf(s[Window], 64, "AMD FSR 1");
+    else snprintf(s[Window], 64, "%s", menu_text(t->scaler ? UI_MENU_OV_SCALE_BILINEAR : UI_MENU_OV_SCALE_NONE));
+#endif
+    snprintf(v[Picture], 64, "%d \xc3\x97 %d", t->image_w, t->image_h);
+    ratio_name(t->image_w, t->image_h, s[Picture], 64);
+    const float arrow = floorf(fs * 0.9f), cw = floorf((w - arrow * (Count - 1)) / Count), ch = floorf(val * 1.5f + sub * 1.5f);
     const float top = y + cap * 1.45f;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < Count; i++) {
         float cx = x + i * (cw + arrow);
         fit_text(dl, cx, y, cw, cap, kLabel, menu_text(caps[i]), true);
         ImVec2 a(cx, top), b(cx + cw, top + ch);
@@ -146,12 +194,51 @@ static float draw_pipeline(const char *key, ImDrawList *dl, float x, float y, fl
         dl->AddRect(a, b, hot ? kAmber : kEdge, 0, 0, hot ? fmaxf(2, floorf(2 * scale)) : 1.0f);
         fit_text(dl, cx + 4 * scale, top + ch * 0.5f - val * 0.95f, cw - 8 * scale, val, kCream, v[i], true);
         fit_text(dl, cx + 4 * scale, top + ch * 0.5f + sub * 0.25f, cw - 8 * scale, sub, kDim, s[i], true);
-        if (i < 3) {   // the arrow to the next stage
+        if (i + 1 < Count) {   // the arrow to the next stage
             float ax = cx + cw + arrow * 0.3f, ay = top + ch * 0.5f, aw = arrow * 0.4f;
             dl->AddTriangleFilled(ImVec2(ax, ay - aw * 0.7f), ImVec2(ax + aw, ay), ImVec2(ax, ay + aw * 0.7f), kAmber);
         }
     }
-    return floorf(top + ch - y);
+    float bottom = top + ch;
+#ifdef GAME_OOT
+    const bool selected = cfg_bool("REKARINA_DLAA");
+    const CfgTaa backend = cfg_taa();
+    const bool bilinear = selected && backend == CFG_TAA_BILINEAR;
+    const bool available = selected && (bilinear || vk_dlaa_available());
+    const bool native = !strcmp(cfg_value("REKARINA_DLSS"), "dlaa");
+    const char *name = !selected ? menu_text(UI_MENU_HDR_TM_VANILLA) :
+                       bilinear ? menu_text(UI_MENU_SCENE_BILINEAR) : backend == CFG_TAA_FSR1 ? "FSR1" :
+                       backend == CFG_TAA_FSR3 ? (menu_fsr4_selected() ? "FSR4" : "FSR3") : "DLSS";
+    char label[128];
+    snprintf(label, sizeof label, menu_text(UI_PIC_SELECTED_UPSCALER), name);
+    const char *quality = selected && !bilinear ? upscale_quality(backend == CFG_TAA_DLSS) : "";
+    if (*quality) {
+        const size_t n = strlen(label);
+        snprintf(label + n, sizeof label - n, " - %s", quality);
+    }
+    const auto line = [&](const char *text, ImU32 color) {
+        ImFont *font = ImGui::GetFont();
+        const float size = floorf(fs * 0.76f);
+        bottom += floorf(fs * 0.25f);
+        dl->AddText(font, size, ImVec2(x, bottom), color, text, nullptr, w);
+        bottom += font->CalcTextSizeA(size, FLT_MAX, w, text).y;
+    };
+    line(label, key && key_is(key, kPipeUpscale) ? kAmber : kCream);
+    if (selected && !available) line(menu_text(UI_MENU_TAA_UNAVAILABLE), kDim);
+    if (available && !bilinear && !vk_dlaa_fsr1())
+        line(menu_text(UI_PIC_FLOW_EARLY_DLSS), kDim);
+    if (!available || (vk_dlaa_fsr1() && native)) {
+        if (available) line(menu_text(UI_PIC_FLOW_NATIVE_FSR1), kDim);
+        line(menu_text(UI_PIC_FLOW_VANILLA), kDim);
+    } else if (bilinear) {
+        line(menu_text(UI_PIC_FLOW_BILINEAR), kDim);
+    } else if (vk_dlaa_fsr1()) {
+        line(menu_text(UI_PIC_FLOW_LATE_REPLACEMENT), kDim);
+    }
+    // RCAS runs in square-root color; any HUD-less capture follows its return to linear light.
+    line(menu_text(UI_PIC_FLOW_OUTPUT), key && key_is(key, kPipeFlow) ? kAmber : kDim);
+#endif
+    return floorf(bottom - y);
 }
 
 // ---- the controller, live

@@ -5,7 +5,7 @@
 //
 // F1 or Esc on the keyboard and Minus and Plus held together (consumed in poll_merged, input_menu_gate in input.h) open it;
 // F1, Esc, B or "Continue" close it. While it is open the game gets no input (input_menu, input.h) and keeps running; the
-// cursor is released from the mouse camera. Tabs Screen, Game, Mods, Sound, Controls and Menu (L / R or Q / E switch
+// cursor is released from the mouse camera. Tabs Graphics, Game, Mods, Sound, Controls and Menu (L / R or Q / E switch
 // them) hold option rows (ui/option_rows.h) over the cfg settings and the mods folder (mods.h); the bottom row has
 // "Continue" and "Quit game".
 // Test hooks (ui/menu.cpp): REKARINA_MENU_TEST=<frame>[:<frames per page>] opens the menu at that presented frame and saves
@@ -54,14 +54,18 @@ typedef struct {
     uint32_t width, height;
     int image_w, image_h;                 // the game image this present shows (its crop)
     int scaler;                           // how the last present scaled it to the window: 0 not, 1 bilinear blit, 2 FSR 1
+#ifdef GAME_OOT
+    uint32_t window_w, window_h;          // swapchain extent, even when the menu is drawn into the game picture
+    const char *nvidia_scene_aa;          // NVIDIA resolve recorded for this frame, independent of the selected quality
+#endif
 } MenuTarget;
 // Lays out this frame's overlay; 1 when there is something to draw. frame: the presented frame (0 unknown). *shot: a
 // path when the test hook wants this frame's swapchain image saved, else NULL. The first open starts ImGui's Vulkan
 // back end and uploads the font. With the menu closed it costs two loads and a compare.
 int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot);
 // Records the frame menu_overlay_frame laid out into cb, which is inside dynamic rendering on the image.
-void menu_overlay_draw(VkCommandBuffer cb, int coverage);
-int menu_overlay_prepare_coverage(void);
+void menu_overlay_draw(VkCommandBuffer cb, int replay);
+int menu_overlay_can_replay(void);
 void menu_vk_release(void);               // before the device goes away (gfx_window_release_vk)
 // The live picture of the open menu: 1 and its place in the swapchain image, {x, y, w, h} in pixels, while the menu laid
 // one out this frame (after menu_overlay_frame). The present copies the game picture there, under the menu.

@@ -26,9 +26,10 @@ void cfg_set(const char *name, const char *value);
 unsigned cfg_version(void);
 // Publish editable settings at the present boundary. Replay pins the resulting immutable view without taking set_lock.
 typedef struct CfgRenderState CfgRenderState;
-enum { CFG_HDR_RENODX_SCENE = 1, CFG_HDR_INPUT_BT709 = 2, CFG_HDR_INPUT_P3 = 4, CFG_HDR_RENODX_EFFECTS = 8 };
+enum { CFG_HDR_RENODX_SCENE = 1, CFG_HDR_RENODX_EFFECTS = 2 };
 typedef enum { CFG_TAA_DLSS, CFG_TAA_FSR3, CFG_TAA_FSR1, CFG_TAA_BILINEAR } CfgTaa;
-enum { CFG_RENDER_UPSCALER = 1, CFG_RENDER_FRAMEGEN_MOTION = 2, CFG_RENDER_INTERFACE_COVERAGE = 4 };
+enum { CFG_RENDER_UPSCALER = 1, CFG_RENDER_FRAMEGEN_MOTION = 2, CFG_RENDER_INTERFACE_COVERAGE = 4,
+       CFG_RENDER_FSR_FALLBACK = 8 };
 typedef struct {
     unsigned projection_revision, renodx_flags;
     int dlaa, sharpness;
